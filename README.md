@@ -95,6 +95,8 @@ cache = PrimeKVCache(num_layers=model.config.n_layer, classifier=clf)
 
 ## Running benchmarks
 
+Individual scripts (each writes to `runs/<timestamp>-<name>/`):
+
 ```bash
 python benchmarks/perplexity_vs_compression.py --model gpt2
 python benchmarks/memory_usage.py --model gpt2 --seq-lens 512 1024 2048
@@ -102,7 +104,38 @@ python benchmarks/latency.py --model gpt2
 python benchmarks/classifier_overhead.py --model gpt2
 ```
 
-Each benchmark logs to `runs/<timestamp>/` by default.
+Unified comparison driver (runs every cache through the same prompt
+and prints a markdown table):
+
+```bash
+python benchmarks/compare.py --model gpt2 --decode-tokens 32
+python benchmarks/compare.py --caches full primekv --prompt "Hello."
+```
+
+## Web interface
+
+A Gradio app is included for interactive experimentation:
+
+```bash
+pip install -e ".[web]"
+python webui/app.py             # http://127.0.0.1:7860
+```
+
+Enter a prompt, pick which caches to compare, tune per-backend
+hyperparameters, and hit **Run**. The UI shows the comparison table,
+PrimeKV's tier distribution, and sample decodes from each cache.
+
+## Testing
+
+All unit tests run on CPU — no GPU required. GPT-2 (124M) is used as
+the default smoke model for benchmarks and works fine on CPU.
+
+```bash
+pytest tests/                   # 33 tests, ~3s on CPU
+```
+
+The adapter is tested against a synthetic HF-shaped fake model so no
+network access is required to run the suite.
 
 ## Design principles
 

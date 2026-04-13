@@ -14,6 +14,13 @@ from primekv.classifier import (
 )
 from primekv.cache import PrimeKVCache, CacheEntry, CacheStats
 from primekv.quantize import quantize_int8, dequantize_int8, quantize_int4, dequantize_int4
+from primekv.eval import (
+    CacheProtocol,
+    Workload,
+    CacheResult,
+    CompareReport,
+    run_comparison,
+)
 
 __all__ = [
     "Tier",
@@ -28,6 +35,11 @@ __all__ = [
     "dequantize_int8",
     "quantize_int4",
     "dequantize_int4",
+    "CacheProtocol",
+    "Workload",
+    "CacheResult",
+    "CompareReport",
+    "run_comparison",
 ]
 
 __version__ = "0.0.1"

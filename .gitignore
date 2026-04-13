@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.Python
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# PrimeKV output
+runs/
+wandb/
+checkpoints/
+*.pt
+*.bin
+*.safetensors
+!tests/fixtures/*.pt
+
+# HF cache (if set locally)
+.hf_cache/

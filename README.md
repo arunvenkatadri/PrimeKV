@@ -1,4 +1,4 @@
-# PrimeKV
+# PrimeKV - Research Project
 
 **Priority-Managed Inference KV Cache**
 

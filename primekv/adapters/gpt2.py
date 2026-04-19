@@ -42,16 +42,23 @@ log = logging.getLogger("primekv.adapters.gpt2")
 
 
 def _to_legacy_tuple(past: Any) -> tuple:
-    """Normalize HF's past_key_values to the legacy tuple format.
+    """Normalize HF's past_key_values to a tuple of ``(K, V)`` pairs.
 
-    HF >= 4.36 returns a ``Cache`` object for many models; older code
-    returns a nested tuple. Both are accepted upstream and our
-    reconstruction code only deals with tuples.
+    Modern transformers (>=4.36) return a ``DynamicCache`` with
+    ``.key_cache`` and ``.value_cache`` list attributes instead of a
+    nested tuple. We normalize both formats into the legacy
+    ``tuple[tuple[Tensor, Tensor], ...]`` shape so downstream code
+    doesn't have to care.
     """
     if past is None:
         return tuple()
+    # DynamicCache (transformers >= 4.36): has .key_cache / .value_cache
+    if hasattr(past, "key_cache") and hasattr(past, "value_cache"):
+        return tuple(zip(past.key_cache, past.value_cache))
+    # Older explicit conversion method.
     if hasattr(past, "to_legacy_cache"):
         return past.to_legacy_cache()
+    # Already a tuple / list of (K, V).
     return past
 
 

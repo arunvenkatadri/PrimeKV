@@ -3,15 +3,13 @@
 The research trick we use here — so we can plug *any* cache backend
 into HuggingFace without monkey-patching attention kernels — is:
 
-1. Run prefill with the model's normal KV cache. This gives us the
-   "ground truth" ``past_key_values`` tuple of shape
-   ``(num_layers, 2, batch, num_heads, seq_len, head_dim)``.
+1. Run prefill with the model's normal KV cache. Extract the
+   ground-truth K/V tensors.
 2. Push every (layer, position) K/V into our tested cache. Depending
    on the cache, this may quantize, evict, or fold entries.
 3. Reconstruct a ``past_key_values``-shaped tuple by pulling each
    entry back out of the cache. Evicted / missing entries are
-   zero-filled (which is the honest quality penalty — other methods
-   are welcome to do something smarter).
+   zero-filled (which is the honest quality penalty).
 4. Run the decode loop with the reconstructed, lossy past.
 5. Measure perplexity by running the full model over the concatenation
    of prompt + generated tokens.
@@ -37,67 +35,118 @@ log = logging.getLogger("primekv.adapters.gpt2")
 
 
 # ---------------------------------------------------------------------------
-# HF cache interop
+# HF cache interop — version-proof K/V extraction
 # ---------------------------------------------------------------------------
 
 
-def _to_legacy_tuple(past: Any) -> tuple:
-    """Normalize HF's past_key_values to a tuple of ``(K, V)`` pairs.
+def _extract_kv_pairs(past: Any) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Extract per-layer ``(K, V)`` tensor pairs from any HF cache format.
 
-    HuggingFace has changed the DynamicCache format across versions:
+    HuggingFace has changed the DynamicCache format multiple times.
+    Rather than checking version numbers, we probe the object for
+    every known access pattern and use the first one that works.
 
-    * **transformers < 4.36**: plain ``tuple[tuple[K, V], ...]``.
-    * **transformers 4.36–5.4**: ``DynamicCache`` with ``.key_cache``
-      and ``.value_cache`` list attributes.
-    * **transformers >= 5.5**: ``DynamicCache`` with ``.layers``; iterating
-      yields 3-tuples ``(keys, values, sliding_window)``.
+    Returns a list of ``(K, V)`` where each tensor is shaped
+    ``(batch, num_heads, seq_len, head_dim)``.
 
-    We handle all three and always return ``tuple[tuple[K, V], ...]``.
+    Raises ``ValueError`` with a diagnostic message if no known
+    format matches.
     """
     if past is None:
-        return tuple()
+        return []
 
-    # transformers >= 5.5: .layers[i].keys / .layers[i].values
-    if hasattr(past, "layers"):
-        return tuple((layer.keys, layer.values) for layer in past.layers)
+    # --- Plain tuple/list of (K, V) pairs (transformers < 4.36) -------
+    if isinstance(past, (tuple, list)) and past:
+        first = past[0]
+        if isinstance(first, (tuple, list)):
+            # Could be 2-tuples or 3-tuples; take first two elements.
+            return [(entry[0], entry[1]) for entry in past]
+        if isinstance(first, torch.Tensor):
+            # Shouldn't happen for past_key_values, but handle it.
+            raise ValueError("past appears to be a flat list of tensors")
 
-    # transformers 4.36–5.4: .key_cache / .value_cache lists
-    if hasattr(past, "key_cache") and hasattr(past, "value_cache"):
-        return tuple(zip(past.key_cache, past.value_cache))
+    # --- DynamicCache with .key_cache / .value_cache (4.36–5.4) -------
+    try:
+        kc = getattr(past, "key_cache", None)
+        vc = getattr(past, "value_cache", None)
+        if kc is not None and vc is not None and len(kc) > 0:
+            return list(zip(kc, vc))
+    except Exception:
+        pass
 
-    # Older explicit conversion method.
-    if hasattr(past, "to_legacy_cache"):
-        return past.to_legacy_cache()
+    # --- DynamicCache with .layers (transformers >= 5.5) --------------
+    try:
+        layers = getattr(past, "layers", None)
+        if layers is not None and len(layers) > 0:
+            pairs = []
+            for layer_obj in layers:
+                # Try common attribute names.
+                k = getattr(layer_obj, "keys", None)
+                if k is None:
+                    k = getattr(layer_obj, "key", None)
+                v = getattr(layer_obj, "values", None)
+                if v is None:
+                    v = getattr(layer_obj, "value", None)
+                if k is not None and v is not None:
+                    pairs.append((k, v))
+                else:
+                    # Try indexing: layer_obj[0], layer_obj[1].
+                    pairs.append((layer_obj[0], layer_obj[1]))
+            if pairs:
+                return pairs
+    except Exception:
+        pass
 
-    # Already a tuple / list — but entries might be 3-tuples from
-    # DynamicCache.__iter__. Strip the third element if present.
-    if past and isinstance(past[0], (tuple, list)) and len(past[0]) > 2:
-        return tuple((entry[0], entry[1]) for entry in past)
+    # --- Iterate the object (handles __iter__ yielding tuples) --------
+    try:
+        pairs = []
+        for item in past:
+            if isinstance(item, (tuple, list)) and len(item) >= 2:
+                pairs.append((item[0], item[1]))
+            elif hasattr(item, "keys") and hasattr(item, "values"):
+                pairs.append((item.keys, item.values))
+            elif hasattr(item, "key") and hasattr(item, "value"):
+                pairs.append((item.key, item.value))
+        if pairs:
+            return pairs
+    except TypeError:
+        pass
 
-    return past
+    # --- to_legacy_cache (some transitional versions) -----------------
+    try:
+        legacy = past.to_legacy_cache()
+        return [(entry[0], entry[1]) for entry in legacy]
+    except Exception:
+        pass
+
+    # --- __getitem__ fallback -----------------------------------------
+    try:
+        n = len(past)
+        return [(past[i][0], past[i][1]) for i in range(n)]
+    except Exception:
+        pass
+
+    attrs = [a for a in dir(past) if not a.startswith("_")]
+    raise ValueError(
+        f"Cannot extract K/V pairs from {type(past).__name__}. "
+        f"Public attrs: {attrs}"
+    )
 
 
 def reconstruct_past_kv(
     cache: CacheProtocol,
-    reference_past: tuple,
+    kv_pairs: list[tuple[torch.Tensor, torch.Tensor]],
     seq_len: int,
 ) -> tuple:
-    """Rebuild an HF-shaped ``past_key_values`` tuple from ``cache``.
+    """Rebuild an HF-compatible ``past_key_values`` tuple from ``cache``.
 
     For each ``(layer, position)`` we look up the cache; misses are
-    zero-filled so the output shape always matches ``reference_past``.
-    This lets the downstream model consume our (lossy) past directly
-    without knowing anything about PrimeKV.
-
-    Args:
-        cache: any :class:`CacheProtocol` implementation.
-        reference_past: the ``past_key_values`` the model produced at
-            prefill. Used only for shape / dtype / device.
-        seq_len: prompt length in tokens.
+    zero-filled so the output shape always matches the reference.
+    Returns a plain tuple of (K, V) pairs which HF models accept as
+    legacy cache format.
     """
     rebuilt: list[tuple[torch.Tensor, torch.Tensor]] = []
-    for layer, (ref_k, ref_v) in enumerate(reference_past):
-        # ref shapes: (batch, num_heads, seq_len, head_dim).
+    for layer, (ref_k, ref_v) in enumerate(kv_pairs):
         new_k = torch.zeros_like(ref_k)
         new_v = torch.zeros_like(ref_v)
         for pos in range(seq_len):
@@ -105,7 +154,6 @@ def reconstruct_past_kv(
             if entry is None:
                 continue
             k, v = entry
-            # k, v shapes from the cache: (num_heads, head_dim).
             new_k[0, :, pos, :] = k.to(new_k.dtype).to(new_k.device)
             new_v[0, :, pos, :] = v.to(new_v.dtype).to(new_v.device)
         rebuilt.append((new_k, new_v))
@@ -145,13 +193,12 @@ def run_with_cache(
     _sync(device)
     t0 = time.perf_counter()
     out = model(input_ids=input_ids, use_cache=True)
-    reference_past = _to_legacy_tuple(out.past_key_values)
+    kv_pairs = _extract_kv_pairs(out.past_key_values)
 
     if hasattr(cache, "classify_prefill"):
-        # PrimeKV needs the classifier to run before puts so tiers are known.
         cache.classify_prefill(input_ids=input_ids[0])
 
-    for layer, (k, v) in enumerate(reference_past):
+    for layer, (k, v) in enumerate(kv_pairs):
         # k, v: (1, num_heads, seq_len, head_dim).
         layer_k = k[0]
         layer_v = v[0]
@@ -161,7 +208,7 @@ def run_with_cache(
     prefill_ms = (time.perf_counter() - t0) * 1000.0
 
     # --- Reconstruct a lossy past and run decode ----------------------
-    lossy_past = reconstruct_past_kv(cache, reference_past, seq_len)
+    lossy_past = reconstruct_past_kv(cache, kv_pairs, seq_len)
 
     generated = input_ids.clone()
     past = lossy_past
@@ -172,7 +219,9 @@ def run_with_cache(
     for _ in range(decode_tokens):
         last = generated[:, -1:]
         step = model(input_ids=last, past_key_values=past, use_cache=True)
-        past = _to_legacy_tuple(step.past_key_values)
+        # During decode, pass the model's own cache back as-is.
+        # Don't convert — the model knows its own format.
+        past = step.past_key_values
         next_id = step.logits[:, -1, :].argmax(dim=-1, keepdim=True)
         generated = torch.cat([generated, next_id], dim=-1)
     _sync(device)
@@ -180,9 +229,6 @@ def run_with_cache(
     tokens_per_s = decode_tokens / (decode_ms / 1000.0) if decode_ms > 0 else 0.0
 
     # --- Perplexity on the full prompt + generated sequence -----------
-    # Cheap, honest quality signal: how plausible is the continuation
-    # under the actual model? A cache that produces garbage decodes
-    # will be penalized here.
     try:
         with torch.no_grad():
             ppl_out = model(input_ids=generated, labels=generated)

@@ -44,21 +44,36 @@ log = logging.getLogger("primekv.adapters.gpt2")
 def _to_legacy_tuple(past: Any) -> tuple:
     """Normalize HF's past_key_values to a tuple of ``(K, V)`` pairs.
 
-    Modern transformers (>=4.36) return a ``DynamicCache`` with
-    ``.key_cache`` and ``.value_cache`` list attributes instead of a
-    nested tuple. We normalize both formats into the legacy
-    ``tuple[tuple[Tensor, Tensor], ...]`` shape so downstream code
-    doesn't have to care.
+    HuggingFace has changed the DynamicCache format across versions:
+
+    * **transformers < 4.36**: plain ``tuple[tuple[K, V], ...]``.
+    * **transformers 4.36–5.4**: ``DynamicCache`` with ``.key_cache``
+      and ``.value_cache`` list attributes.
+    * **transformers >= 5.5**: ``DynamicCache`` with ``.layers``; iterating
+      yields 3-tuples ``(keys, values, sliding_window)``.
+
+    We handle all three and always return ``tuple[tuple[K, V], ...]``.
     """
     if past is None:
         return tuple()
-    # DynamicCache (transformers >= 4.36): has .key_cache / .value_cache
+
+    # transformers >= 5.5: .layers[i].keys / .layers[i].values
+    if hasattr(past, "layers"):
+        return tuple((layer.keys, layer.values) for layer in past.layers)
+
+    # transformers 4.36–5.4: .key_cache / .value_cache lists
     if hasattr(past, "key_cache") and hasattr(past, "value_cache"):
         return tuple(zip(past.key_cache, past.value_cache))
+
     # Older explicit conversion method.
     if hasattr(past, "to_legacy_cache"):
         return past.to_legacy_cache()
-    # Already a tuple / list of (K, V).
+
+    # Already a tuple / list — but entries might be 3-tuples from
+    # DynamicCache.__iter__. Strip the third element if present.
+    if past and isinstance(past[0], (tuple, list)) and len(past[0]) > 2:
+        return tuple((entry[0], entry[1]) for entry in past)
+
     return past
 
 

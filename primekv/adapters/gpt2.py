@@ -160,6 +160,38 @@ def reconstruct_past_kv(
     return tuple(rebuilt)
 
 
+def _wrap_as_hf_cache(kv_pairs: list[tuple[torch.Tensor, torch.Tensor]]) -> Any:
+    """Wrap a list of (K, V) pairs in whatever cache type the model expects.
+
+    Modern transformers (>=5.5) requires past_key_values to be a
+    ``DynamicCache`` instance with ``.get_seq_length()``; older versions
+    accept a plain tuple. We try ``from_legacy_cache`` first, then
+    manual ``update`` calls, then fall back to the raw tuple.
+    """
+    legacy = tuple(kv_pairs)
+    try:
+        from transformers import DynamicCache
+    except ImportError:
+        return legacy
+
+    # Try the classmethod constructor first (works on most versions).
+    try:
+        return DynamicCache.from_legacy_cache(legacy)
+    except (AttributeError, TypeError, NotImplementedError):
+        pass
+
+    # Manual construction by calling .update() per layer.
+    try:
+        cache_obj = DynamicCache()
+        for layer_idx, (k, v) in enumerate(kv_pairs):
+            cache_obj.update(k, v, layer_idx)
+        return cache_obj
+    except Exception:
+        pass
+
+    return legacy
+
+
 # ---------------------------------------------------------------------------
 # End-to-end runner
 # ---------------------------------------------------------------------------
@@ -208,7 +240,8 @@ def run_with_cache(
     prefill_ms = (time.perf_counter() - t0) * 1000.0
 
     # --- Reconstruct a lossy past and run decode ----------------------
-    lossy_past = reconstruct_past_kv(cache, kv_pairs, seq_len)
+    lossy_tuple = reconstruct_past_kv(cache, kv_pairs, seq_len)
+    lossy_past = _wrap_as_hf_cache(list(lossy_tuple))
 
     generated = input_ids.clone()
     past = lossy_past

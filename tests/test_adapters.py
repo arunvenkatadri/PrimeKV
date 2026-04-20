@@ -65,6 +65,22 @@ def test_reconstruct_populates_hit_positions_zeros_misses():
 # ---------------------------------------------------------------------------
 
 
+def _normalize_past(past):
+    """Reduce any HF cache format to a list of (K, V) pairs for the fake model."""
+    if past is None:
+        return None
+    if isinstance(past, (tuple, list)):
+        return list(past)
+    # DynamicCache: try common access patterns.
+    if hasattr(past, "key_cache") and hasattr(past, "value_cache"):
+        return list(zip(past.key_cache, past.value_cache))
+    if hasattr(past, "layers"):
+        return [(getattr(l, "keys", None), getattr(l, "values", None)) for l in past.layers]
+    if hasattr(past, "to_legacy_cache"):
+        return list(past.to_legacy_cache())
+    return None
+
+
 @dataclass
 class _FakeConfig:
     n_layer: int = 2
@@ -126,14 +142,16 @@ class _FakeCausalLM:
 
         past = None
         if use_cache:
-            # If we received a prior past, extend each layer's K/V by seq_len
-            # new positions. Otherwise start fresh.
+            # Normalize past_key_values: may arrive as a tuple OR a
+            # DynamicCache wrapper (the adapter wraps when modern
+            # transformers is installed).
+            prev_pairs = _normalize_past(past_key_values)
             new_past = []
             for layer in range(self.num_layers):
                 k_new = torch.randn(batch, self.num_heads, seq_len, self.head_dim)
                 v_new = torch.randn(batch, self.num_heads, seq_len, self.head_dim)
-                if past_key_values is not None and len(past_key_values) > layer:
-                    prev_k, prev_v = past_key_values[layer]
+                if prev_pairs is not None and len(prev_pairs) > layer:
+                    prev_k, prev_v = prev_pairs[layer]
                     k_new = torch.cat([prev_k, k_new], dim=-2)
                     v_new = torch.cat([prev_v, v_new], dim=-2)
                 new_past.append((k_new, v_new))

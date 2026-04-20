@@ -12,6 +12,7 @@ from primekv.sweep import (
     SweepPoint,
     SweepReport,
     plot_report,
+    sweep_2d_tradeoff,
     sweep_ablate_primekv,
     sweep_pareto,
     sweep_vs_length,
@@ -190,6 +191,101 @@ def test_sweep_ablate_rejects_unknown_axis():
         assert False, "should have raised"
     except ValueError as e:
         assert "unknown ablation axis" in str(e)
+
+
+# ---------------------------------------------------------------------------
+# 2D tradeoff sweep
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_2d_tradeoff_primekv_fills_the_plane():
+    model = _FakeCausalLM(num_layers=2, num_heads=2, head_dim=4, vocab=17)
+    tok = _FakeTokenizer(vocab=17)
+
+    report = sweep_2d_tradeoff(
+        model=model,
+        tokenizer=tok,
+        prompt="hello world this is a test",
+        eviction_caps=[4, 8],
+        precisions=["fp16", "int4"],
+        caches=["full", "uniform_int4", "h2o", "primekv"],
+        decode_tokens=1,
+        max_length=16,
+        device="cpu",
+    )
+    assert report.mode == "2d_tradeoff"
+
+    # Full / uniform_int4 → 1 point each.
+    full_pts = [p for p in report.points if p.cache == "full"]
+    int4_pts = [p for p in report.points if p.cache == "uniform_int4"]
+    h2o_pts = [p for p in report.points if p.cache == "h2o"]
+    primekv_pts = [p for p in report.points if p.cache == "primekv"]
+    assert len(full_pts) == 1
+    assert len(int4_pts) == 1
+    # H2O fills the eviction axis only (2 caps × 1 precision).
+    assert len(h2o_pts) == 2
+    assert all(p.extra["precision"] == "fp16" for p in h2o_pts)
+    # PrimeKV fills the plane (2 caps × 2 precisions).
+    assert len(primekv_pts) == 4
+    precisions_seen = {p.extra["precision"] for p in primekv_pts}
+    assert precisions_seen == {"fp16", "int4"}
+
+
+def test_sweep_2d_rejects_unknown_precision():
+    model = _FakeCausalLM(num_layers=1, num_heads=2, head_dim=4, vocab=17)
+    tok = _FakeTokenizer(vocab=17)
+    try:
+        sweep_2d_tradeoff(
+            model=model,
+            tokenizer=tok,
+            prompt="x",
+            eviction_caps=[4],
+            precisions=["int2"],
+            device="cpu",
+        )
+        assert False, "should have raised"
+    except ValueError as e:
+        assert "unknown precision" in str(e)
+
+
+def test_plot_2d_tradeoff_renders(tmp_path):
+    """The 2D mode should render a valid figure with the scatter legend."""
+    report = SweepReport(
+        mode="2d_tradeoff",
+        axis_label="compression_ratio",
+        points=[
+            SweepPoint(
+                cache="full",
+                sweep_axis="2d",
+                sweep_value=1.0,
+                memory_bytes=1000,
+                compression_ratio=1.0,
+                perplexity=7.0,
+                prefill_ms=1,
+                decode_ms=1,
+                tokens_per_second=1,
+                extra={"cap": float("inf"), "precision": "fp16"},
+            ),
+            SweepPoint(
+                cache="primekv",
+                sweep_axis="2d",
+                sweep_value=2.5,
+                memory_bytes=400,
+                compression_ratio=2.5,
+                perplexity=8.0,
+                prefill_ms=1,
+                decode_ms=1,
+                tokens_per_second=1,
+                extra={"cap": 16.0, "precision": "int4"},
+            ),
+        ],
+    )
+    out = tmp_path / "plot.png"
+    fig = plot_report(report, output_path=str(out))
+    assert out.exists()
+    import matplotlib.pyplot as plt
+
+    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------

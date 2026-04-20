@@ -114,13 +114,29 @@ class SweepReport:
 # ---------------------------------------------------------------------------
 
 
-def _build_primekv(num_layers: int, supporting_cap: int, **kwargs) -> PrimeKVCache:
+def _build_primekv(
+    num_layers: int,
+    supporting_cap: int,
+    tier2_precision: str = "int4",
+    **kwargs,
+) -> PrimeKVCache:
+    from primekv.cache import DEFAULT_POLICIES, TierPolicy
+
+    policies = dict(DEFAULT_POLICIES)
+    # Allow the caller to override Tier 2's precision (FP16 / INT8 / INT4).
+    # This is what makes the 2D eviction × quantization sweep possible.
+    policies[Tier.SUPPORTING] = TierPolicy(
+        precision=tier2_precision,
+        location="hbm",
+        evictable=True,
+    )
     return PrimeKVCache(
         num_layers=num_layers,
         classifier=RuleBasedClassifier(
             anchor_prefix_len=kwargs.get("anchor_prefix_len", 16),
             semantic_stride=kwargs.get("semantic_stride", 3),
         ),
+        policies=policies,
         max_entries_per_tier={Tier.SUPPORTING: int(supporting_cap)},
         enable_dynamic_reclassification=kwargs.get(
             "enable_dynamic_reclassification", True
@@ -420,6 +436,121 @@ def sweep_ablate_primekv(
 
 
 # ---------------------------------------------------------------------------
+# 2D sweep: eviction × quantization
+# ---------------------------------------------------------------------------
+
+
+# Caches capable of eviction (varying cap makes sense).
+_EVICTION_CAPABLE = {"h2o", "streamingllm", "primekv"}
+# Caches capable of quantization (varying precision makes sense).
+_QUANT_CAPABLE = {"uniform_quant", "primekv"}
+# Fixed singletons.
+_FIXED_SINGLETON = {"full"}
+
+
+def sweep_2d_tradeoff(
+    model,
+    tokenizer,
+    prompt: str,
+    eviction_caps: list[int],
+    precisions: list[str],
+    caches: Optional[list[str]] = None,
+    decode_tokens: int = 8,
+    max_length: int = 256,
+    device: str = "cpu",
+    progress: Optional[Callable[[str], None]] = None,
+) -> SweepReport:
+    """Sweep eviction × quantization simultaneously.
+
+    Each cache fills in the cells it's capable of reaching:
+
+    * ``full`` → one cell (no eviction, no quantization)
+    * ``uniform_int8`` / ``uniform_int4`` → one cell each (keep all, quantize)
+    * ``h2o``, ``streamingllm`` → column (vary eviction, FP16 only)
+    * ``primekv`` → full grid (vary both eviction and Tier-2 precision)
+
+    This is the figure that shows PrimeKV's **two-lever** control surface
+    vs. single-lever baselines.
+
+    ``precisions`` entries must be in ``{"fp16", "int8", "int4"}``.
+    """
+    if caches is None:
+        caches = ["full", "uniform_int8", "uniform_int4", "h2o", "streamingllm", "primekv"]
+    for p in precisions:
+        if p not in {"fp16", "int8", "int4"}:
+            raise ValueError(f"unknown precision: {p}")
+
+    num_layers = _num_layers(model)
+    workload = Workload(prompt=prompt, decode_tokens=decode_tokens, max_length=max_length)
+    report = SweepReport(
+        mode="2d_tradeoff",
+        axis_label="compression_ratio",
+        meta={
+            "eviction_caps": eviction_caps,
+            "precisions": precisions,
+            "decode_tokens": decode_tokens,
+            "max_length": max_length,
+            "device": device,
+        },
+    )
+    full_cache = FullCache(num_layers)
+
+    def _emit(cache_name: str, cap_value: float, precision: str, cache) -> None:
+        if progress:
+            progress(f"running {cache_name} cap={cap_value} prec={precision}")
+        full_cache.reset()
+        metrics = _with_full_baseline(
+            cache_name, cache, full_cache, workload, model, tokenizer, device
+        )
+        report.points.append(
+            SweepPoint(
+                cache=cache_name,
+                sweep_axis="2d",
+                sweep_value=metrics["compression_ratio"],
+                **metrics,
+                extra={"cap": cap_value, "precision": precision},
+            )
+        )
+
+    for cache_name in caches:
+        if cache_name == "full":
+            _emit("full", float("inf"), "fp16", FullCache(num_layers))
+            continue
+        if cache_name == "uniform_int8":
+            _emit("uniform_int8", float("inf"), "int8", UniformQuantCache(num_layers, bits=8))
+            continue
+        if cache_name == "uniform_int4":
+            _emit("uniform_int4", float("inf"), "int4", UniformQuantCache(num_layers, bits=4))
+            continue
+        if cache_name == "h2o":
+            for cap in eviction_caps:
+                _emit("h2o", float(cap), "fp16", H2OCache(num_layers, capacity=int(cap)))
+            continue
+        if cache_name == "streamingllm":
+            for cap in eviction_caps:
+                _emit(
+                    "streamingllm",
+                    float(cap),
+                    "fp16",
+                    StreamingLLMCache(num_layers, num_sinks=4, window=int(cap)),
+                )
+            continue
+        if cache_name == "primekv":
+            for cap in eviction_caps:
+                for prec in precisions:
+                    _emit(
+                        "primekv",
+                        float(cap),
+                        prec,
+                        _build_primekv(num_layers, supporting_cap=cap, tier2_precision=prec),
+                    )
+            continue
+        raise ValueError(f"unknown cache name: {cache_name}")
+
+    return report
+
+
+# ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
 
@@ -484,6 +615,34 @@ def plot_report(report: SweepReport, output_path: Optional[str] = None):
         ax.set_xlabel(report.axis_label)
         ax.set_ylabel("perplexity (lower = better)")
         ax.set_title(f"PrimeKV ablation: {report.axis_label}")
+    elif report.mode == "2d_tradeoff":
+        # Scatter of every (cache, config) point. PrimeKV shows up as a
+        # cloud because it explores the 2D eviction × quantization surface.
+        # Precision is encoded as marker shape; cache as color.
+        precision_markers = {"fp16": "o", "int8": "s", "int4": "^"}
+        for name, pts in groups.items():
+            color = _CACHE_COLORS.get(name, None)
+            for prec, marker in precision_markers.items():
+                prec_pts = [p for p in pts if p.extra.get("precision") == prec]
+                if not prec_pts:
+                    continue
+                xs = [p.compression_ratio for p in prec_pts]
+                ys = [p.perplexity for p in prec_pts if p.perplexity is not None]
+                if not ys:
+                    continue
+                label = f"{name} ({prec})"
+                size = 120 if len(prec_pts) == 1 else 60
+                ax.scatter(
+                    xs, ys, marker=marker, s=size, label=label,
+                    color=color, edgecolors="black", linewidths=0.5, alpha=0.85,
+                )
+        ax.set_xscale("log")
+        ax.set_xlabel("compression ratio (higher = more compressed)")
+        ax.set_ylabel("perplexity (lower = better)")
+        ax.set_title(
+            "2D tradeoff: eviction × quantization\n"
+            "(○ FP16, ■ INT8, ▲ INT4 — PrimeKV is the only method filling the plane)"
+        )
     else:
         raise ValueError(f"unknown mode: {report.mode}")
 

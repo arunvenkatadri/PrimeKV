@@ -23,6 +23,7 @@ if str(_REPO_ROOT) not in sys.path:
 from primekv.sweep import (
     SweepReport,
     plot_report,
+    sweep_2d_tradeoff,
     sweep_ablate_primekv,
     sweep_pareto,
     sweep_vs_length,
@@ -96,6 +97,22 @@ def cmd_vs_length(args, model, tokenizer, device: str) -> None:
     _write_report(report, "sweep-vs-length")
 
 
+def cmd_2d(args, model, tokenizer, device: str) -> None:
+    report = sweep_2d_tradeoff(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=args.prompt,
+        eviction_caps=args.capacities,
+        precisions=args.precisions,
+        decode_tokens=args.decode_tokens,
+        max_length=args.max_length,
+        device=device,
+        progress=print,
+    )
+    _print_summary(report)
+    _write_report(report, "sweep-2d")
+
+
 def cmd_ablate(args, model, tokenizer, device: str) -> None:
     axis = args.ablate
     if axis == "anchor_prefix_len":
@@ -136,6 +153,12 @@ def main() -> None:
     mode.add_argument("--pareto", action="store_true")
     mode.add_argument("--vs-length", action="store_true")
     mode.add_argument(
+        "--2d",
+        dest="two_d",
+        action="store_true",
+        help="2D eviction × quantization tradeoff sweep",
+    )
+    mode.add_argument(
         "--ablate",
         choices=[
             "anchor_prefix_len",
@@ -161,6 +184,13 @@ def main() -> None:
         help="prompt length grid for --vs-length",
     )
     ap.add_argument("--capacity", type=int, default=16, help="fixed capacity for --vs-length/--ablate")
+    ap.add_argument(
+        "--precisions",
+        nargs="+",
+        default=["fp16", "int8", "int4"],
+        choices=["fp16", "int8", "int4"],
+        help="precisions to sweep for --2d (PrimeKV Tier 2)",
+    )
 
     args = ap.parse_args()
 
@@ -174,6 +204,8 @@ def main() -> None:
         cmd_pareto(args, model, tok, device)
     elif args.vs_length:
         cmd_vs_length(args, model, tok, device)
+    elif args.two_d:
+        cmd_2d(args, model, tok, device)
     elif args.ablate:
         cmd_ablate(args, model, tok, device)
 

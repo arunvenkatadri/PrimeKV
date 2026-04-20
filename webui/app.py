@@ -174,6 +174,7 @@ def _run_sweep(
     try:
         from primekv.sweep import (
             plot_report,
+            sweep_2d_tradeoff,
             sweep_ablate_primekv,
             sweep_pareto,
             sweep_vs_length,
@@ -208,6 +209,18 @@ def _run_sweep(
                 lengths=lengths,
                 capacity=int(fixed_capacity),
                 decode_tokens=int(decode_tokens),
+                device=device,
+            )
+        elif mode == "2d":
+            caps = _parse_ints(capacities_str, [8, 16, 32, 64])
+            report = sweep_2d_tradeoff(
+                model=model,
+                tokenizer=tok,
+                prompt=prompt,
+                eviction_caps=caps,
+                precisions=["fp16", "int8", "int4"],
+                decode_tokens=int(decode_tokens),
+                max_length=int(max_length),
                 device=device,
             )
         elif mode == "ablate":
@@ -376,9 +389,9 @@ def build_demo():
                         label="Prompt",
                     )
                     sweep_mode = gr.Radio(
-                        choices=["pareto", "vs_length", "ablate"],
+                        choices=["pareto", "vs_length", "2d", "ablate"],
                         value="pareto",
-                        label="Sweep mode",
+                        label="Sweep mode ('2d' = eviction × quantization tradeoff)",
                     )
                     sweep_capacities = gr.Textbox(
                         value="4 8 16 32 64 128",

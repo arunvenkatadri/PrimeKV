@@ -197,12 +197,12 @@ def build_demo():
                     label="Caches to compare",
                 )
                 with gr.Accordion("Cache hyperparameters", open=False):
-                    h2o_cap = gr.Slider(16, 1024, value=256, step=16, label="H2O capacity")
+                    h2o_cap = gr.Slider(4, 1024, value=256, step=4, label="H2O capacity")
                     stream_window = gr.Slider(
-                        16, 1024, value=256, step=16, label="StreamingLLM window"
+                        4, 1024, value=256, step=4, label="StreamingLLM window"
                     )
                     primekv_cap = gr.Slider(
-                        16, 1024, value=256, step=16, label="PrimeKV Tier.SUPPORTING cap"
+                        4, 1024, value=256, step=4, label="PrimeKV Tier.SUPPORTING cap"
                     )
                     primekv_stride = gr.Slider(
                         1, 10, value=3, step=1, label="PrimeKV semantic stride"

@@ -7,8 +7,10 @@ inference that classifies cached key-value entries by **structural role**
 rather than by attention magnitude, and then applies per-class retention,
 precision, and eviction policies.
 
-> Status: early research scaffold. Interfaces and numbers are unstable; do not
-> use this for anything that needs to work.
+> **Status:** early research scaffold, public for feedback. Method does not
+> yet beat attention-based baselines on modern instruction-tuned models;
+> see "Current results" below for the honest state. Interfaces, numbers,
+> and the classifier are all expected to change.
 
 ## The core idea
 
@@ -50,6 +52,50 @@ PrimeKV is inspired by the three-zone context compression architecture in
   pinned    HBM/INT8  INT4/CPU  evicted
    FP16                offload
 ```
+
+## Current results (honest)
+
+These are preliminary. Everything runs end-to-end but the method has **not** been shown to beat attention-based baselines on a real instruction-tuned model yet.
+
+### GPT-2 (124M), 256-token prompt, aggressive capacity
+
+| cache | compression | perplexity |
+|-------|-------------|-----------|
+| full | 1.0x | 7.3 |
+| uniform_int4 | 4.0x | 7.3 |
+| h2o | 20.9x | 17.0 |
+| streamingllm | 13.9x | 17.6 |
+| **primekv** | **2.5x** | **11.7** |
+
+On GPT-2, PrimeKV beats attention-based eviction (H2O, StreamingLLM) at the quality end of the tradeoff — meaningfully closer to full-cache quality at moderate compression.
+
+### Qwen2.5-3B, 3500-token prompt, 2D sweep across eviction × quantization
+
+All methods land within 0.14 perplexity of each other at up to 40x compression. Modern instruction-tuned models are robust enough that none of the tested compression methods produce meaningful quality differences at this context length. **PrimeKV does not win on this benchmark**; uniform INT4 quantization achieves the lowest perplexity at 4x compression.
+
+This is a real finding, not a failure. It tells us:
+1. The rule-based (positional) classifier is not encoding genuine structural role.
+2. Method differentiation requires longer contexts (8k+) or weaker models.
+3. The paper's core claim is still open — it needs a trained classifier to be fairly evaluated.
+
+See `paper/linkedin_post.md` for the draft writeup of this status.
+
+## Limitations
+
+- **Rule-based classifier.** The current `RuleBasedClassifier` uses positional heuristics (anchor prefix + semantic stride). This is a placeholder; the method's thesis depends on having a classifier that encodes real structural role (POS-tagging, NER, or a trained MLP head).
+- **GPT-2-first validation.** The adapter works on modern models (tested with Qwen2.5-3B) but most sweeps were developed against GPT-2. Longer contexts (8k+) have not been tested.
+- **No fair "H2O with pinning" baseline.** A stronger comparison would be H2O with the first N tokens pinned (removing PrimeKV's anchor-pinning advantage). We don't have that baseline yet.
+- **Perplexity only.** No downstream task evaluation (LongBench, RULER, etc.).
+- **Production tooling integration.** vLLM / TensorRT-LLM integration is explicitly out of scope for v0.
+
+## Planned next steps
+
+- POS/NER-based classifier (spaCy labels → tier assignments)
+- Trained MLP classifier with weak labels from teacher attention
+- LongBench and RULER evaluation suites
+- Fair baselines: H2O+pinning, StreamingLLM+quantization
+- 7B+ models at 8k-32k context (where compression actually bites)
+- Optional: autoresearch loop for hyperparameter optimization
 
 ## Repository layout
 

@@ -130,7 +130,13 @@ def _run(
         )
         report = run_comparison(caches, workload, model, tok, device=device)
 
-        rows = report.as_rows()
+        # Convert dicts to list-of-lists for Gradio Dataframe rendering.
+        row_dicts = report.as_rows()
+        if row_dicts:
+            cols = list(row_dicts[0].keys())
+            rows = [[r[c] for c in cols] for r in row_dicts]
+        else:
+            rows = []
 
         # Tier distribution for PrimeKV, if it was in the run.
         tier_rows: list[list] = []

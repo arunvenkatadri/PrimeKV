@@ -78,8 +78,6 @@ This is a real finding, not a failure. It tells us:
 2. Method differentiation requires longer contexts (8k+) or weaker models.
 3. The paper's core claim is still open — it needs a trained classifier to be fairly evaluated.
 
-See `paper/linkedin_post.md` for the draft writeup of this status.
-
 ## Limitations
 
 - **Rule-based classifier.** The current `RuleBasedClassifier` uses positional heuristics (anchor prefix + semantic stride). This is a placeholder; the method's thesis depends on having a classifier that encodes real structural role (POS-tagging, NER, or a trained MLP head).

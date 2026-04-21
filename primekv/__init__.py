@@ -11,8 +11,9 @@ from primekv.classifier import (
     BaseClassifier,
     RuleBasedClassifier,
     MLPClassifier,
+    SpaCyClassifier,
 )
-from primekv.cache import PrimeKVCache, CacheEntry, CacheStats
+from primekv.cache import PrimeKVCache, CacheEntry, CacheStats, TierPolicy, DEFAULT_POLICIES
 from primekv.quantize import quantize_int8, dequantize_int8, quantize_int4, dequantize_int4
 from primekv.eval import (
     CacheProtocol,
@@ -21,6 +22,21 @@ from primekv.eval import (
     CompareReport,
     run_comparison,
 )
+from primekv.tuning import (
+    TuningProfile,
+    auto_tune,
+    build_cache_from_profile,
+    describe_profile,
+    estimate_bytes,
+)
+from primekv.reasoning_eval import (
+    ReasoningTest,
+    ReasoningResult,
+    ReasoningReport,
+    default_tests,
+    run_reasoning_eval,
+    grade,
+)
 
 __all__ = [
     "Tier",
@@ -28,9 +44,12 @@ __all__ = [
     "BaseClassifier",
     "RuleBasedClassifier",
     "MLPClassifier",
+    "SpaCyClassifier",
     "PrimeKVCache",
     "CacheEntry",
     "CacheStats",
+    "TierPolicy",
+    "DEFAULT_POLICIES",
     "quantize_int8",
     "dequantize_int8",
     "quantize_int4",
@@ -40,6 +59,17 @@ __all__ = [
     "CacheResult",
     "CompareReport",
     "run_comparison",
+    "TuningProfile",
+    "auto_tune",
+    "build_cache_from_profile",
+    "describe_profile",
+    "estimate_bytes",
+    "ReasoningTest",
+    "ReasoningResult",
+    "ReasoningReport",
+    "default_tests",
+    "run_reasoning_eval",
+    "grade",
 ]
 
 __version__ = "0.0.1"

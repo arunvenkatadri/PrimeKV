@@ -228,7 +228,18 @@ def run_with_cache(
     kv_pairs = _extract_kv_pairs(out.past_key_values)
 
     if hasattr(cache, "classify_prefill"):
-        cache.classify_prefill(input_ids=input_ids[0])
+        # SpaCyClassifier wants the raw text + tokenizer so it can
+        # align linguistic structure to subword ids. Detect via duck
+        # typing to avoid a hard import of SpaCyClassifier here.
+        classifier = getattr(cache, "classifier", None)
+        if classifier is not None and classifier.__class__.__name__ == "SpaCyClassifier":
+            cache.classify_prefill(
+                input_ids=input_ids[0],
+                text=workload.prompt,
+                tokenizer=tokenizer,
+            )
+        else:
+            cache.classify_prefill(input_ids=input_ids[0])
 
     for layer, (k, v) in enumerate(kv_pairs):
         # k, v: (1, num_heads, seq_len, head_dim).

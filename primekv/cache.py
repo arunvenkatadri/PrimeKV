@@ -183,10 +183,15 @@ class PrimeKVCache:
         self,
         input_ids: Optional[torch.Tensor] = None,
         hidden_states: Optional[torch.Tensor] = None,
+        **classifier_kwargs,
     ) -> TierAssignment:
-        """Run the classifier once at prefill and remember the assignment."""
+        """Run the classifier once at prefill and remember the assignment.
+
+        Extra kwargs are forwarded to the classifier — this is how
+        :class:`SpaCyClassifier` receives ``text`` and ``tokenizer``.
+        """
         assignment = self.classifier.classify(
-            input_ids=input_ids, hidden_states=hidden_states
+            input_ids=input_ids, hidden_states=hidden_states, **classifier_kwargs
         )
         for pos, t in enumerate(assignment.tiers.tolist()):
             self._tier_of_position[pos] = Tier(t)

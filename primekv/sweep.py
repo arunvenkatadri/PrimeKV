@@ -34,7 +34,7 @@ from primekv.baselines import (
     UniformQuantCache,
 )
 from primekv.cache import PrimeKVCache
-from primekv.classifier import RuleBasedClassifier, Tier
+from primekv.classifier import BaseClassifier, RuleBasedClassifier, Tier
 from primekv.eval import Workload, run_comparison
 
 log = logging.getLogger("primekv.sweep")
@@ -118,6 +118,7 @@ def _build_primekv(
     num_layers: int,
     supporting_cap: int,
     tier2_precision: str = "int4",
+    classifier_factory: Optional[Callable[[], "BaseClassifier"]] = None,
     **kwargs,
 ) -> PrimeKVCache:
     from primekv.cache import DEFAULT_POLICIES, TierPolicy
@@ -130,12 +131,16 @@ def _build_primekv(
         location="hbm",
         evictable=True,
     )
-    return PrimeKVCache(
-        num_layers=num_layers,
-        classifier=RuleBasedClassifier(
+    if classifier_factory is not None:
+        classifier = classifier_factory()
+    else:
+        classifier = RuleBasedClassifier(
             anchor_prefix_len=kwargs.get("anchor_prefix_len", 16),
             semantic_stride=kwargs.get("semantic_stride", 3),
-        ),
+        )
+    return PrimeKVCache(
+        num_layers=num_layers,
+        classifier=classifier,
         policies=policies,
         max_entries_per_tier={Tier.SUPPORTING: int(supporting_cap)},
         enable_dynamic_reclassification=kwargs.get(
@@ -459,6 +464,7 @@ def sweep_2d_tradeoff(
     max_length: int = 256,
     device: str = "cpu",
     progress: Optional[Callable[[str], None]] = None,
+    primekv_classifier_factory: Optional[Callable[[], "BaseClassifier"]] = None,
 ) -> SweepReport:
     """Sweep eviction × quantization simultaneously.
 
@@ -542,7 +548,12 @@ def sweep_2d_tradeoff(
                         "primekv",
                         float(cap),
                         prec,
-                        _build_primekv(num_layers, supporting_cap=cap, tier2_precision=prec),
+                        _build_primekv(
+                            num_layers,
+                            supporting_cap=cap,
+                            tier2_precision=prec,
+                            classifier_factory=primekv_classifier_factory,
+                        ),
                     )
             continue
         raise ValueError(f"unknown cache name: {cache_name}")

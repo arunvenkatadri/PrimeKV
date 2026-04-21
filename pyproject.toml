@@ -35,6 +35,13 @@ dev = [
 web = [
     "gradio>=4.0",
 ]
+spacy = [
+    "spacy>=3.7",
+]
+autoresearch = [
+    "anthropic>=0.34",
+    "openai>=1.40",
+]
 
 [project.urls]
 Homepage = "https://github.com/arunvenkatadri/primekv"
@@ -50,3 +57,6 @@ target-version = "py310"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "slow: tests that download models or run a full forward pass",
+]

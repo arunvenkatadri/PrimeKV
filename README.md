@@ -34,8 +34,8 @@ reactive, attention-score-driven methods. A constraint token mentioned once
 early in the prompt may have low cumulative attention but is structurally
 critical, and PrimeKV can keep it around.
 
-PrimeKV is inspired by the three-zone context compression architecture in
-[Clawboss], applied to the inference-time KV cache.
+PrimeKV is inspired by a three-zone context compression architecture from
+prior work, applied to the inference-time KV cache.
 
 ```
          prefill tokens
@@ -107,7 +107,6 @@ primekv/          core package
   baselines.py    full / H2O / StreamingLLM / uniform quant
 tests/            unit + smoke tests
 benchmarks/       perplexity / memory / latency / classifier_overhead
-paper/            outline and notes
 ```
 
 ## Install
@@ -192,8 +191,3 @@ network access is required to run the suite.
 - **No production frameworks yet.** Vanilla PyTorch + HuggingFace. vLLM /
   TensorRT-LLM integration is explicitly out of scope for v0.
 
-## Citing
-
-See `paper/outline.md` for the current paper draft outline.
-
-[Clawboss]: #  "internal: Clawboss context compression architecture"

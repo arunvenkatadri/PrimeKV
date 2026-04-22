@@ -198,7 +198,7 @@ def test_sweep_ablate_rejects_unknown_axis():
 # ---------------------------------------------------------------------------
 
 
-def test_sweep_2d_tradeoff_primekv_fills_the_plane():
+def test_sweep_2d_tradeoff_every_capacity_cache_fills_the_plane():
     model = _FakeCausalLM(num_layers=2, num_heads=2, head_dim=4, vocab=17)
     tok = _FakeTokenizer(vocab=17)
 
@@ -208,7 +208,7 @@ def test_sweep_2d_tradeoff_primekv_fills_the_plane():
         prompt="hello world this is a test",
         eviction_caps=[4, 8],
         precisions=["fp16", "int4"],
-        caches=["full", "uniform_int4", "h2o", "primekv"],
+        caches=["full", "uniform_int4", "h2o", "streamingllm", "primekv"],
         decode_tokens=1,
         max_length=16,
         device="cpu",
@@ -219,16 +219,18 @@ def test_sweep_2d_tradeoff_primekv_fills_the_plane():
     full_pts = [p for p in report.points if p.cache == "full"]
     int4_pts = [p for p in report.points if p.cache == "uniform_int4"]
     h2o_pts = [p for p in report.points if p.cache == "h2o"]
+    streaming_pts = [p for p in report.points if p.cache == "streamingllm"]
     primekv_pts = [p for p in report.points if p.cache == "primekv"]
     assert len(full_pts) == 1
     assert len(int4_pts) == 1
-    # H2O fills the eviction axis only (2 caps × 1 precision).
-    assert len(h2o_pts) == 2
-    assert all(p.extra["precision"] == "fp16" for p in h2o_pts)
-    # PrimeKV fills the plane (2 caps × 2 precisions).
+    # Every capacity-driven cache now fills the plane (2 caps × 2 precisions)
+    # via the composed H2OQuantCache / StreamingQuantCache baselines.
+    assert len(h2o_pts) == 4
+    assert {p.extra["precision"] for p in h2o_pts} == {"fp16", "int4"}
+    assert len(streaming_pts) == 4
+    assert {p.extra["precision"] for p in streaming_pts} == {"fp16", "int4"}
     assert len(primekv_pts) == 4
-    precisions_seen = {p.extra["precision"] for p in primekv_pts}
-    assert precisions_seen == {"fp16", "int4"}
+    assert {p.extra["precision"] for p in primekv_pts} == {"fp16", "int4"}
 
 
 def test_sweep_2d_rejects_unknown_precision():

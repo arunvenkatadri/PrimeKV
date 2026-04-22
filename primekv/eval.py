@@ -79,12 +79,23 @@ class Workload:
             reconstructed KV cache.
         max_length: Tokenizer truncation length for the prompt.
         name: Human-readable label, only used for logging / reports.
+        seed: Optional RNG seed. When set, :func:`run_with_cache` seeds
+            torch and numpy before the decode loop, making sampling
+            runs reproducible. Has no effect on argmax decoding.
+        sample_top_k: If >0, decode with top-k sampling at temperature
+            ``sample_temperature`` instead of argmax. Needed to make
+            ``seed`` produce different outputs across runs.
+        sample_temperature: Softmax temperature for sampling. Ignored
+            when ``sample_top_k == 0``.
     """
 
     prompt: str
     decode_tokens: int = 32
     max_length: int = 256
     name: str = "default"
+    seed: Optional[int] = None
+    sample_top_k: int = 0
+    sample_temperature: float = 1.0
 
 
 @dataclass

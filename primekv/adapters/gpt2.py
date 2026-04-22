@@ -247,6 +247,17 @@ def run_with_cache(
     past = lossy_past
     decode_tokens = max(1, int(workload.decode_tokens))
 
+    # Seed *inside* the run so that each cache sees the same RNG state.
+    # Without this, decode order across caches would perturb the RNG and
+    # each cache would effectively get a different seed.
+    if workload.seed is not None:
+        torch.manual_seed(int(workload.seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(workload.seed))
+
+    top_k = int(workload.sample_top_k)
+    temperature = max(1e-5, float(workload.sample_temperature))
+
     _sync(device)
     t1 = time.perf_counter()
     for _ in range(decode_tokens):
@@ -255,7 +266,15 @@ def run_with_cache(
         # During decode, pass the model's own cache back as-is.
         # Don't convert — the model knows its own format.
         past = step.past_key_values
-        next_id = step.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        logits = step.logits[:, -1, :]
+        if top_k > 0:
+            logits = logits / temperature
+            topk_vals, topk_idx = torch.topk(logits, k=min(top_k, logits.shape[-1]), dim=-1)
+            probs = torch.softmax(topk_vals, dim=-1)
+            choice = torch.multinomial(probs, num_samples=1)
+            next_id = topk_idx.gather(-1, choice)
+        else:
+            next_id = logits.argmax(dim=-1, keepdim=True)
         generated = torch.cat([generated, next_id], dim=-1)
     _sync(device)
     decode_ms = (time.perf_counter() - t1) * 1000.0

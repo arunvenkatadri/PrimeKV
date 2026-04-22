@@ -22,6 +22,7 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import statistics
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Optional
 
@@ -30,7 +31,9 @@ import torch
 from primekv.baselines import (
     FullCache,
     H2OCache,
+    H2OQuantCache,
     StreamingLLMCache,
+    StreamingQuantCache,
     UniformQuantCache,
 )
 from primekv.cache import PrimeKVCache
@@ -144,6 +147,9 @@ def _build_primekv(
     )
 
 
+_PRECISION_TO_BITS = {"fp16": None, "int8": 8, "int4": 4}
+
+
 def _cache_for(name: str, num_layers: int, capacity: int, **kwargs) -> Any:
     if name == "full":
         return FullCache(num_layers)
@@ -153,9 +159,21 @@ def _cache_for(name: str, num_layers: int, capacity: int, **kwargs) -> Any:
         return UniformQuantCache(num_layers, bits=4)
     if name == "h2o":
         return H2OCache(num_layers, capacity=int(capacity))
+    if name == "h2o_int8":
+        return H2OQuantCache(num_layers, capacity=int(capacity), bits=8)
+    if name == "h2o_int4":
+        return H2OQuantCache(num_layers, capacity=int(capacity), bits=4)
     if name == "streamingllm":
         return StreamingLLMCache(
             num_layers, num_sinks=kwargs.get("num_sinks", 4), window=int(capacity)
+        )
+    if name == "streamingllm_int8":
+        return StreamingQuantCache(
+            num_layers, num_sinks=kwargs.get("num_sinks", 4), window=int(capacity), bits=8
+        )
+    if name == "streamingllm_int4":
+        return StreamingQuantCache(
+            num_layers, num_sinks=kwargs.get("num_sinks", 4), window=int(capacity), bits=4
         )
     if name == "primekv":
         return _build_primekv(num_layers, supporting_cap=int(capacity), **kwargs)
@@ -210,6 +228,24 @@ def _run_once(
     }
 
 
+def _make_workload(
+    prompt: str,
+    decode_tokens: int,
+    max_length: int,
+    seed: Optional[int],
+    sample_top_k: int,
+    sample_temperature: float,
+) -> Workload:
+    return Workload(
+        prompt=prompt,
+        decode_tokens=decode_tokens,
+        max_length=max_length,
+        seed=seed,
+        sample_top_k=sample_top_k,
+        sample_temperature=sample_temperature,
+    )
+
+
 def _with_full_baseline(
     cache_name: str,
     cache,
@@ -248,6 +284,9 @@ def sweep_pareto(
     max_length: int = 512,
     device: str = "cpu",
     progress: Optional[Callable[[str], None]] = None,
+    seed: Optional[int] = None,
+    sample_top_k: int = 0,
+    sample_temperature: float = 1.0,
 ) -> SweepReport:
     """Pareto quality/compression curve for every cache in ``caches``.
 
@@ -258,7 +297,9 @@ def sweep_pareto(
     """
     caches = caches or list(FIXED_COMPRESSION_CACHES) + list(CAPACITY_CACHES)
     num_layers = _num_layers(model)
-    workload = Workload(prompt=prompt, decode_tokens=decode_tokens, max_length=max_length)
+    workload = _make_workload(
+        prompt, decode_tokens, max_length, seed, sample_top_k, sample_temperature
+    )
 
     report = SweepReport(
         mode="pareto",
@@ -268,6 +309,9 @@ def sweep_pareto(
             "decode_tokens": decode_tokens,
             "max_length": max_length,
             "device": device,
+            "seed": seed,
+            "sample_top_k": sample_top_k,
+            "sample_temperature": sample_temperature,
         },
     )
 
@@ -322,6 +366,9 @@ def sweep_vs_length(
     decode_tokens: int = 16,
     device: str = "cpu",
     progress: Optional[Callable[[str], None]] = None,
+    seed: Optional[int] = None,
+    sample_top_k: int = 0,
+    sample_temperature: float = 1.0,
 ) -> SweepReport:
     """Sweep prompt length at fixed capacity.
 
@@ -339,15 +386,16 @@ def sweep_vs_length(
             "capacity": capacity,
             "decode_tokens": decode_tokens,
             "device": device,
+            "seed": seed,
+            "sample_top_k": sample_top_k,
+            "sample_temperature": sample_temperature,
         },
     )
     full_cache = FullCache(num_layers)
 
     for length in lengths:
-        workload = Workload(
-            prompt=prompt,
-            decode_tokens=decode_tokens,
-            max_length=int(length),
+        workload = _make_workload(
+            prompt, decode_tokens, int(length), seed, sample_top_k, sample_temperature
         )
         for cache_name in caches:
             if progress:
@@ -379,6 +427,9 @@ def sweep_ablate_primekv(
     max_length: int = 512,
     device: str = "cpu",
     progress: Optional[Callable[[str], None]] = None,
+    seed: Optional[int] = None,
+    sample_top_k: int = 0,
+    sample_temperature: float = 1.0,
 ) -> SweepReport:
     """PrimeKV ablation. ``axis`` is one of:
 
@@ -396,7 +447,9 @@ def sweep_ablate_primekv(
         raise ValueError(f"unknown ablation axis: {axis}")
 
     num_layers = _num_layers(model)
-    workload = Workload(prompt=prompt, decode_tokens=decode_tokens, max_length=max_length)
+    workload = _make_workload(
+        prompt, decode_tokens, max_length, seed, sample_top_k, sample_temperature
+    )
     report = SweepReport(
         mode="ablate",
         axis_label=axis,
@@ -405,6 +458,9 @@ def sweep_ablate_primekv(
             "decode_tokens": decode_tokens,
             "max_length": max_length,
             "values": values,
+            "seed": seed,
+            "sample_top_k": sample_top_k,
+            "sample_temperature": sample_temperature,
         },
     )
     full_cache = FullCache(num_layers)
@@ -442,8 +498,11 @@ def sweep_ablate_primekv(
 
 # Caches capable of eviction (varying cap makes sense).
 _EVICTION_CAPABLE = {"h2o", "streamingllm", "primekv"}
-# Caches capable of quantization (varying precision makes sense).
-_QUANT_CAPABLE = {"uniform_quant", "primekv"}
+# Caches capable of quantization (varying precision makes sense). Note:
+# ``h2o`` and ``streamingllm`` are now in this set via the composed
+# H2OQuantCache / StreamingQuantCache baselines, so the 2D sweep puts
+# every capacity-driven method on the same 2D surface.
+_QUANT_CAPABLE = {"uniform_quant", "h2o", "streamingllm", "primekv"}
 # Fixed singletons.
 _FIXED_SINGLETON = {"full"}
 
@@ -459,6 +518,9 @@ def sweep_2d_tradeoff(
     max_length: int = 256,
     device: str = "cpu",
     progress: Optional[Callable[[str], None]] = None,
+    seed: Optional[int] = None,
+    sample_top_k: int = 0,
+    sample_temperature: float = 1.0,
 ) -> SweepReport:
     """Sweep eviction × quantization simultaneously.
 
@@ -466,11 +528,13 @@ def sweep_2d_tradeoff(
 
     * ``full`` → one cell (no eviction, no quantization)
     * ``uniform_int8`` / ``uniform_int4`` → one cell each (keep all, quantize)
-    * ``h2o``, ``streamingllm`` → column (vary eviction, FP16 only)
+    * ``h2o``, ``streamingllm`` → **full grid** (eviction × precision),
+      via :class:`H2OQuantCache` / :class:`StreamingQuantCache`. This
+      makes the comparison against PrimeKV two-lever-vs-two-lever.
     * ``primekv`` → full grid (vary both eviction and Tier-2 precision)
 
-    This is the figure that shows PrimeKV's **two-lever** control surface
-    vs. single-lever baselines.
+    Every capacity-driven baseline now occupies the full 2D plane, so
+    PrimeKV no longer gets a free "only method with two levers" win.
 
     ``precisions`` entries must be in ``{"fp16", "int8", "int4"}``.
     """
@@ -481,7 +545,9 @@ def sweep_2d_tradeoff(
             raise ValueError(f"unknown precision: {p}")
 
     num_layers = _num_layers(model)
-    workload = Workload(prompt=prompt, decode_tokens=decode_tokens, max_length=max_length)
+    workload = _make_workload(
+        prompt, decode_tokens, max_length, seed, sample_top_k, sample_temperature
+    )
     report = SweepReport(
         mode="2d_tradeoff",
         axis_label="compression_ratio",
@@ -491,6 +557,9 @@ def sweep_2d_tradeoff(
             "decode_tokens": decode_tokens,
             "max_length": max_length,
             "device": device,
+            "seed": seed,
+            "sample_top_k": sample_top_k,
+            "sample_temperature": sample_temperature,
         },
     )
     full_cache = FullCache(num_layers)
@@ -524,16 +593,25 @@ def sweep_2d_tradeoff(
             continue
         if cache_name == "h2o":
             for cap in eviction_caps:
-                _emit("h2o", float(cap), "fp16", H2OCache(num_layers, capacity=int(cap)))
+                for prec in precisions:
+                    bits = _PRECISION_TO_BITS[prec]
+                    if bits is None:
+                        cache = H2OCache(num_layers, capacity=int(cap))
+                    else:
+                        cache = H2OQuantCache(num_layers, capacity=int(cap), bits=bits)
+                    _emit("h2o", float(cap), prec, cache)
             continue
         if cache_name == "streamingllm":
             for cap in eviction_caps:
-                _emit(
-                    "streamingllm",
-                    float(cap),
-                    "fp16",
-                    StreamingLLMCache(num_layers, num_sinks=4, window=int(cap)),
-                )
+                for prec in precisions:
+                    bits = _PRECISION_TO_BITS[prec]
+                    if bits is None:
+                        cache = StreamingLLMCache(num_layers, num_sinks=4, window=int(cap))
+                    else:
+                        cache = StreamingQuantCache(
+                            num_layers, num_sinks=4, window=int(cap), bits=bits
+                        )
+                    _emit("streamingllm", float(cap), prec, cache)
             continue
         if cache_name == "primekv":
             for cap in eviction_caps:
@@ -548,6 +626,217 @@ def sweep_2d_tradeoff(
         raise ValueError(f"unknown cache name: {cache_name}")
 
     return report
+
+
+# ---------------------------------------------------------------------------
+# Long-context sweep
+# ---------------------------------------------------------------------------
+
+
+# Default length grid for long-context runs. Spaced logarithmically so
+# we can see where each method breaks. The top of the range needs a
+# model whose ``max_position_embeddings`` actually supports it
+# (GPT-2 caps at 1024 — use Qwen2.5-3B or similar).
+DEFAULT_LONG_LENGTHS = [512, 1024, 2048, 4096, 8192, 16384]
+
+
+def sweep_long_context(
+    model,
+    tokenizer,
+    prompt: str,
+    lengths: Optional[list[int]] = None,
+    caches: Optional[list[str]] = None,
+    capacity_fraction: float = 0.1,
+    min_capacity: int = 32,
+    precisions: Optional[list[str]] = None,
+    decode_tokens: int = 16,
+    device: str = "cpu",
+    progress: Optional[Callable[[str], None]] = None,
+    seed: Optional[int] = None,
+    sample_top_k: int = 0,
+    sample_temperature: float = 1.0,
+) -> SweepReport:
+    """Perplexity vs context length at fixed *relative* capacity.
+
+    The key difference from :func:`sweep_vs_length`: capacity scales
+    with prompt length so every cell represents the same *fraction* of
+    tokens retained (``capacity_fraction``, min ``min_capacity``). That
+    is the honest long-context question — "what's the quality cost of
+    keeping 10% of a 16k-token cache?" — not "what happens at a fixed
+    16-token budget as context grows?".
+
+    Runs composed baselines (``h2o_int4``, ``streamingllm_int4``) along
+    with PrimeKV by default so the comparison is two-lever-vs-two-lever
+    at long context.
+    """
+    if lengths is None:
+        lengths = list(DEFAULT_LONG_LENGTHS)
+    if caches is None:
+        # Full is too expensive at 16k on a single GPU; uniform_int4 is
+        # cheap and acts as the "no eviction, pure quant" reference.
+        caches = [
+            "uniform_int4",
+            "h2o_int4",
+            "streamingllm_int4",
+            "primekv",
+        ]
+    if precisions is None:
+        precisions = ["int4"]
+
+    num_layers = _num_layers(model)
+    report = SweepReport(
+        mode="long_context",
+        axis_label="prompt_length",
+        meta={
+            "lengths": lengths,
+            "capacity_fraction": capacity_fraction,
+            "min_capacity": min_capacity,
+            "decode_tokens": decode_tokens,
+            "precisions": precisions,
+            "device": device,
+            "seed": seed,
+            "sample_top_k": sample_top_k,
+            "sample_temperature": sample_temperature,
+        },
+    )
+    full_cache = FullCache(num_layers)
+
+    for length in lengths:
+        capacity = max(int(min_capacity), int(length * capacity_fraction))
+        workload = _make_workload(
+            prompt, decode_tokens, int(length), seed, sample_top_k, sample_temperature
+        )
+        for cache_name in caches:
+            for prec in precisions:
+                # Build the cache for this (name, precision) cell.
+                if cache_name in FIXED_COMPRESSION_CACHES:
+                    if prec != "int4" and cache_name == "uniform_int4":
+                        # ``uniform_int4`` is pinned at int4 by name — skip other precisions.
+                        continue
+                    cache = _cache_for(cache_name, num_layers, capacity=0)
+                elif cache_name == "primekv":
+                    cache = _build_primekv(
+                        num_layers, supporting_cap=capacity, tier2_precision=prec
+                    )
+                elif cache_name in ("h2o", "streamingllm"):
+                    # FP16 variant (no quantization composed).
+                    cache = _cache_for(cache_name, num_layers, capacity=capacity)
+                elif cache_name in ("h2o_int8", "h2o_int4", "streamingllm_int8", "streamingllm_int4"):
+                    # Pre-composed variant — precision is fixed by the name.
+                    cache = _cache_for(cache_name, num_layers, capacity=capacity)
+                else:
+                    raise ValueError(f"unknown cache name for long-context sweep: {cache_name}")
+
+                if progress:
+                    progress(f"running {cache_name} ({prec}) len={length} cap={capacity}")
+                full_cache.reset()
+                metrics = _with_full_baseline(
+                    cache_name, cache, full_cache, workload, model, tokenizer, device
+                )
+                report.points.append(
+                    SweepPoint(
+                        cache=cache_name,
+                        sweep_axis="prompt_length",
+                        sweep_value=float(length),
+                        **metrics,
+                        extra={"capacity": capacity, "precision": prec},
+                    )
+                )
+
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Seed aggregation
+# ---------------------------------------------------------------------------
+
+
+def _cell_key(p: SweepPoint) -> tuple:
+    """Identifier that should be stable across seeded repeats of the same sweep."""
+    extras = tuple(sorted(
+        (k, v) for k, v in p.extra.items()
+        if k not in {"stats", "tier_distribution"}
+    ))
+    return (p.cache, p.sweep_axis, p.sweep_value, extras)
+
+
+def _mean_std(xs: list[float]) -> tuple[float, float]:
+    xs = [x for x in xs if x is not None]
+    if not xs:
+        return (float("nan"), float("nan"))
+    if len(xs) == 1:
+        return (float(xs[0]), 0.0)
+    return (statistics.fmean(xs), statistics.pstdev(xs))
+
+
+def aggregate_reports(reports: list[SweepReport]) -> SweepReport:
+    """Merge N :class:`SweepReport` s (e.g. from N seeded runs) into one.
+
+    Points with the same ``(cache, sweep_axis, sweep_value, extra)``
+    are collapsed; each numeric metric is replaced by its mean across
+    runs, with ``<metric>_std`` written into ``extra``. The ``meta``
+    dict records the seed list.
+
+    Typical use::
+
+        seeds = [0, 1, 2, 3, 4]
+        reports = [sweep_pareto(..., seed=s, sample_top_k=50) for s in seeds]
+        agg = aggregate_reports(reports)
+    """
+    if not reports:
+        raise ValueError("aggregate_reports needs at least one report")
+
+    mode = reports[0].mode
+    axis = reports[0].axis_label
+    for r in reports[1:]:
+        if r.mode != mode or r.axis_label != axis:
+            raise ValueError("reports have inconsistent mode/axis")
+
+    grouped: dict[tuple, list[SweepPoint]] = {}
+    for r in reports:
+        for p in r.points:
+            grouped.setdefault(_cell_key(p), []).append(p)
+
+    metric_names = (
+        "memory_bytes",
+        "compression_ratio",
+        "perplexity",
+        "prefill_ms",
+        "decode_ms",
+        "tokens_per_second",
+    )
+
+    merged: list[SweepPoint] = []
+    for key, pts in grouped.items():
+        first = pts[0]
+        extra = dict(first.extra)
+        extra["n_runs"] = len(pts)
+        agg_metrics: dict[str, float] = {}
+        for m in metric_names:
+            vals = [getattr(p, m) for p in pts]
+            mean, std = _mean_std(vals)
+            agg_metrics[m] = mean
+            extra[f"{m}_std"] = std
+        merged.append(
+            SweepPoint(
+                cache=first.cache,
+                sweep_axis=first.sweep_axis,
+                sweep_value=first.sweep_value,
+                memory_bytes=int(agg_metrics["memory_bytes"]) if agg_metrics["memory_bytes"] == agg_metrics["memory_bytes"] else 0,
+                compression_ratio=agg_metrics["compression_ratio"],
+                perplexity=agg_metrics["perplexity"] if agg_metrics["perplexity"] == agg_metrics["perplexity"] else None,
+                prefill_ms=agg_metrics["prefill_ms"],
+                decode_ms=agg_metrics["decode_ms"],
+                tokens_per_second=agg_metrics["tokens_per_second"],
+                extra=extra,
+            )
+        )
+
+    meta = dict(reports[0].meta)
+    meta["seeds"] = [r.meta.get("seed") for r in reports]
+    meta["n_reports"] = len(reports)
+
+    return SweepReport(mode=mode, axis_label=axis, points=merged, meta=meta)
 
 
 # ---------------------------------------------------------------------------
@@ -615,6 +904,44 @@ def plot_report(report: SweepReport, output_path: Optional[str] = None):
         ax.set_xlabel(report.axis_label)
         ax.set_ylabel("perplexity (lower = better)")
         ax.set_title(f"PrimeKV ablation: {report.axis_label}")
+    elif report.mode == "long_context":
+        # One line per (cache, precision). Precision lives in extra so
+        # different precision rollups of the same cache get their own
+        # line. Eviction capacity scales with length, so we plot ppl
+        # against absolute prompt length on a log axis.
+        precision_styles = {"fp16": "-", "int8": "--", "int4": ":"}
+        seen_labels = set()
+        for name, pts in groups.items():
+            color = _CACHE_COLORS.get(name, None)
+            # Partition points by precision so lines don't cross.
+            buckets: dict[str, list[SweepPoint]] = {}
+            for p in pts:
+                buckets.setdefault(str(p.extra.get("precision", "fp16")), []).append(p)
+            for prec, prec_pts in buckets.items():
+                prec_pts.sort(key=lambda x: x.sweep_value)
+                xs = [p.sweep_value for p in prec_pts]
+                ys = [p.perplexity for p in prec_pts]
+                if all(y is None for y in ys):
+                    continue
+                label = f"{name} ({prec})"
+                if label in seen_labels:
+                    continue
+                seen_labels.add(label)
+                ax.plot(
+                    xs, ys,
+                    marker="o",
+                    linestyle=precision_styles.get(prec, "-"),
+                    color=color,
+                    label=label,
+                )
+        ax.set_xscale("log")
+        ax.set_xlabel("prompt length (tokens, log scale)")
+        ax.set_ylabel("perplexity (lower = better)")
+        ax.set_title(
+            "Long-context: quality vs context length\n"
+            f"(capacity = {report.meta.get('capacity_fraction')} × length, "
+            f"min {report.meta.get('min_capacity')})"
+        )
     elif report.mode == "2d_tradeoff":
         # Scatter of every (cache, config) point. PrimeKV shows up as a
         # cloud because it explores the 2D eviction × quantization surface.

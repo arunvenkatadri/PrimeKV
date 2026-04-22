@@ -3,7 +3,9 @@ import torch
 from primekv.baselines import (
     FullCache,
     H2OCache,
+    H2OQuantCache,
     StreamingLLMCache,
+    StreamingQuantCache,
     UniformQuantCache,
 )
 
@@ -55,3 +57,41 @@ def test_uniform_int4_smaller_than_int8():
     c8.put(0, 0, k, v)
     c4.put(0, 0, k, v)
     assert c4.memory_bytes() < c8.memory_bytes()
+
+
+def test_h2o_quant_evicts_lowest_attention_and_dequantizes():
+    c = H2OQuantCache(num_layers=1, capacity=2, bits=4)
+    k = torch.randn(2, 16)
+    v = torch.randn(2, 16)
+    for pos in range(3):
+        c.put(0, pos, k, v)
+        c.observe_attention(0, pos, score=float(pos))
+    # Eviction: lowest attention (pos 0) gone; others survive.
+    assert c.get(0, 0) is None
+    gk, gv = c.get(0, 1)
+    assert gk.shape == k.shape and gv.shape == v.shape
+
+
+def test_h2o_quant_smaller_than_h2o_fp16():
+    fp = H2OCache(num_layers=1, capacity=8)
+    q4 = H2OQuantCache(num_layers=1, capacity=8, bits=4)
+    k = torch.randn(4, 32)
+    v = torch.randn(4, 32)
+    for pos in range(6):
+        fp.put(0, pos, k, v)
+        q4.put(0, pos, k, v)
+    # Composed baseline must actually compress (int4 ≈ 1/4 of fp16).
+    assert q4.memory_bytes() < fp.memory_bytes()
+
+
+def test_streaming_quant_keeps_sinks_and_window():
+    c = StreamingQuantCache(num_layers=1, num_sinks=2, window=2, bits=4)
+    k = torch.randn(2, 16)
+    v = torch.randn(2, 16)
+    for pos in range(6):
+        c.put(0, pos, k, v)
+    # Sinks (0,1) and last two non-sinks (4,5) survive; 2,3 dropped.
+    for p in (0, 1, 4, 5):
+        assert c.get(0, p) is not None
+    for p in (2, 3):
+        assert c.get(0, p) is None

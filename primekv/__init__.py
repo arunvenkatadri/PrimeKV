@@ -21,6 +21,14 @@ from primekv.eval import (
     CompareReport,
     run_comparison,
 )
+from primekv.reasoning import (
+    ReasoningTest,
+    ReasoningOutcome,
+    ReasoningReport,
+    default_reasoning_suite,
+    run_reasoning_suite,
+    plot_reasoning_report,
+)
 
 __all__ = [
     "Tier",
@@ -40,6 +48,12 @@ __all__ = [
     "CacheResult",
     "CompareReport",
     "run_comparison",
+    "ReasoningTest",
+    "ReasoningOutcome",
+    "ReasoningReport",
+    "default_reasoning_suite",
+    "run_reasoning_suite",
+    "plot_reasoning_report",
 ]
 
 __version__ = "0.0.1"

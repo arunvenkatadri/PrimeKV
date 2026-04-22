@@ -21,6 +21,11 @@ for faster feedback loops.
 
 from __future__ import annotations
 
+# Gradio renders matplotlib figures server-side — force Agg before any
+# plt import or Gradio's capture won't get a non-interactive backend.
+import matplotlib as _mpl
+_mpl.use("Agg")
+
 import argparse
 import logging
 import traceback

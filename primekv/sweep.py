@@ -579,11 +579,10 @@ _CACHE_COLORS = {
 def plot_report(report: SweepReport, output_path: Optional[str] = None):
     """Render ``report`` to a matplotlib Figure and optionally save it.
 
-    Returns the figure so callers can embed it (e.g. Gradio).
+    Returns the figure so callers can embed it (e.g. Gradio, Jupyter).
+    The caller is responsible for choosing a backend — don't force Agg
+    here or inline rendering in notebooks breaks.
     """
-    import matplotlib
-
-    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(8, 5))

@@ -318,3 +318,160 @@ def run_with_cache(
         generated=decoded,
         extra=extra,
     )
+
+
+# ---------------------------------------------------------------------------
+# Streaming-prefill runner (chunked PrimeKV)
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def streaming_run_with_cache(
+    name: str,
+    cache: CacheProtocol,
+    model,
+    tokenizer,
+    workload: Workload,
+    chunk_size: int = 256,
+    device: str = "cpu",
+) -> CacheResult:
+    """Run prefill in chunks, with cache compaction between chunks.
+
+    The peak-memory variant of :func:`run_with_cache`. Each chunk's
+    prefill attends only to the *lossy reconstruction* of prior chunks,
+    so we never hold the full FP16 K/V tensor in memory — only one
+    chunk's worth of new K/V plus whatever the cache has retained.
+
+    This is what gives chunked PrimeKV a wedge that uniform INT4 can't
+    match: int4 still has to compute full-precision K/V before
+    quantizing. Streaming-chunked compresses *before* the next chunk's
+    prefill needs to attend over it.
+
+    Cost: each chunk's K/V depends on the lossy reconstruction of prior
+    chunks, so compression error compounds. Section 9.3 of the notebook
+    measures whether the model can tolerate this for one chunk
+    boundary; ``streaming_run_with_cache`` is the multi-chunk
+    generalization.
+
+    Args:
+        chunk_size: Tokens per prefill chunk. The peak memory benefit
+            relative to global prefill is ~``chunk_size`` per layer.
+    """
+    enc = tokenizer(
+        workload.prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=workload.max_length,
+    )
+    input_ids = enc["input_ids"].to(device)
+    seq_len = int(input_ids.shape[-1])
+
+    cache.reset()
+    if hasattr(cache, "classify_prefill"):
+        # Classify against the full prompt up-front so per-chunk inserts
+        # see globally-correct tier assignments. The cost is one extra
+        # tokenizer pass; the alternative (per-chunk classification with
+        # local indices) would corrupt anchor/stride globally.
+        cache.classify_prefill(input_ids=input_ids[0])
+
+    _sync(device)
+    t0 = time.perf_counter()
+
+    last_kv_pairs: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None
+    past = None
+    for chunk_start in range(0, seq_len, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, seq_len)
+        chunk_ids = input_ids[:, chunk_start:chunk_end]
+
+        # Build past from the cache's current (lossy) state — that is the
+        # whole point of the streaming variant: chunk N attends only to
+        # whatever survived compaction of chunks 0..N-1.
+        if last_kv_pairs is not None:
+            lossy_prior = reconstruct_past_kv(cache, last_kv_pairs, chunk_start)
+            past = _wrap_as_hf_cache(list(lossy_prior))
+
+        out = model(input_ids=chunk_ids, past_key_values=past, use_cache=True)
+        kv_pairs = _extract_kv_pairs(out.past_key_values)
+
+        # Push only this chunk's new positions into the cache.
+        for layer, (k, v) in enumerate(kv_pairs):
+            # k, v: (1, num_heads, chunk_end, head_dim) — the model
+            # appends to the past, so columns [chunk_start, chunk_end)
+            # are the new ones.
+            for pos in range(chunk_start, chunk_end):
+                cache.put(layer, pos, k[0, :, pos, :], v[0, :, pos, :])
+        last_kv_pairs = kv_pairs
+
+    _sync(device)
+    prefill_ms = (time.perf_counter() - t0) * 1000.0
+
+    # Decode against the final lossy reconstruction.
+    if last_kv_pairs is None:
+        # Degenerate: empty prompt.
+        lossy_final = tuple()
+    else:
+        lossy_final = reconstruct_past_kv(cache, last_kv_pairs, seq_len)
+    lossy_past = _wrap_as_hf_cache(list(lossy_final))
+
+    generated = input_ids.clone()
+    past = lossy_past
+    decode_tokens = max(1, int(workload.decode_tokens))
+
+    if workload.seed is not None:
+        torch.manual_seed(int(workload.seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(workload.seed))
+
+    top_k = int(workload.sample_top_k)
+    temperature = max(1e-5, float(workload.sample_temperature))
+
+    _sync(device)
+    t1 = time.perf_counter()
+    for _ in range(decode_tokens):
+        last = generated[:, -1:]
+        step = model(input_ids=last, past_key_values=past, use_cache=True)
+        past = step.past_key_values
+        logits = step.logits[:, -1, :]
+        if top_k > 0:
+            logits = logits / temperature
+            topk_vals, topk_idx = torch.topk(logits, k=min(top_k, logits.shape[-1]), dim=-1)
+            probs = torch.softmax(topk_vals, dim=-1)
+            choice = torch.multinomial(probs, num_samples=1)
+            next_id = topk_idx.gather(-1, choice)
+        else:
+            next_id = logits.argmax(dim=-1, keepdim=True)
+        generated = torch.cat([generated, next_id], dim=-1)
+    _sync(device)
+    decode_ms = (time.perf_counter() - t1) * 1000.0
+    tokens_per_s = decode_tokens / (decode_ms / 1000.0) if decode_ms > 0 else 0.0
+
+    try:
+        with torch.no_grad():
+            ppl_out = model(input_ids=generated, labels=generated)
+        ppl = float(math.exp(ppl_out.loss.item()))
+    except Exception as e:  # pragma: no cover
+        log.warning("ppl compute failed for streaming cache=%s: %s", name, e)
+        ppl = None
+
+    extra: dict = {"streaming_chunk_size": chunk_size}
+    if hasattr(cache, "stats"):
+        from primekv.metrics import summarize_stats
+
+        extra["stats"] = summarize_stats(cache.stats)
+
+    try:
+        decoded = tokenizer.decode(generated[0], skip_special_tokens=True)
+    except Exception:  # pragma: no cover
+        decoded = None
+
+    return CacheResult(
+        name=name,
+        memory_bytes=int(cache.memory_bytes()),
+        compression_ratio=1.0,
+        perplexity=ppl,
+        prefill_ms=prefill_ms,
+        decode_ms=decode_ms,
+        tokens_per_second=tokens_per_s,
+        generated=decoded,
+        extra=extra,
+    )

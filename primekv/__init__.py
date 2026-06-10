@@ -29,6 +29,10 @@ from primekv.reasoning import (
     run_reasoning_suite,
     plot_reasoning_report,
 )
+from primekv.classifier_training import (
+    teacher_labels_from_attention,
+    train_mlp_classifier_on_prompt,
+)
 
 __all__ = [
     "Tier",
@@ -54,6 +58,8 @@ __all__ = [
     "default_reasoning_suite",
     "run_reasoning_suite",
     "plot_reasoning_report",
+    "teacher_labels_from_attention",
+    "train_mlp_classifier_on_prompt",
 ]
 
 __version__ = "0.0.1"

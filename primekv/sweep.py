@@ -34,6 +34,7 @@ from primekv.baselines import (
     H2OQuantCache,
     StreamingLLMCache,
     StreamingQuantCache,
+    ThreeZoneCache,
     UniformQuantCache,
 )
 from primekv.cache import PrimeKVCache
@@ -177,6 +178,16 @@ def _cache_for(name: str, num_layers: int, capacity: int, **kwargs) -> Any:
         )
     if name == "primekv":
         return _build_primekv(num_layers, supporting_cap=int(capacity), **kwargs)
+    if name == "three_zone":
+        # ``capacity`` is interpreted as the rolling FP16 window size.
+        # Middle pool defaults to int4 with no capacity cap unless overridden.
+        return ThreeZoneCache(
+            num_layers,
+            num_anchor=int(kwargs.get("num_anchor", 16)),
+            recent_window=int(capacity),
+            middle_capacity=kwargs.get("middle_capacity"),
+            middle_bits=kwargs.get("middle_bits", 4),
+        )
     raise ValueError(f"unknown cache name: {name}")
 
 

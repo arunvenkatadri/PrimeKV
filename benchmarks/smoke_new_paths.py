@@ -277,6 +277,81 @@ def main() -> int:
         failures.append(f"lossy_prefill: {e}")
         print(f"FAILED: {e}")
 
+    # ------------------------------------------------------------------ 7
+    banner("7. ThreeZoneCache: anchor + rolling FP16 + compressed middle")
+    try:
+        from primekv.baselines import ThreeZoneCache
+        from primekv.eval import Workload, run_comparison
+
+        tz = ThreeZoneCache(n_layers, num_anchor=8, recent_window=24, middle_bits=4)
+        rep = run_comparison(
+            {"three_zone": tz},
+            Workload(prompt=PROMPT * 2, decode_tokens=4, max_length=128),
+            model, tok, device="cpu",
+        )
+        r = rep.results[0]
+        zones = {
+            "anchor": sum(len(p) for p in tz._anchor),
+            "recent": sum(len(p) for p in tz._recent),
+            "middle": sum(len(p) for p in tz._middle),
+        }
+        print(f"three_zone: ppl={r.perplexity:.3f}  mem={r.memory_bytes/1024:.1f}KB")
+        print(f"populated zones: {zones}")
+        assert zones["anchor"] > 0, "anchor zone should be populated"
+        print("OK: three-zone cache populates all expected zones")
+    except Exception as e:
+        failures.append(f"three_zone: {e}")
+        print(f"FAILED: {e}")
+
+    # ------------------------------------------------------------------ 8
+    banner("8. streaming_run_with_cache: chunked prefill end-to-end")
+    try:
+        from primekv.adapters.gpt2 import streaming_run_with_cache
+        from primekv.baselines import FullCache, UniformQuantCache, ThreeZoneCache
+        from primekv.eval import Workload
+
+        wl = Workload(prompt=PROMPT * 2, decode_tokens=4, max_length=160)
+        chunk = 32
+        rows = []
+        for name, c in [
+            ("full",         FullCache(n_layers)),
+            ("uniform_int4", UniformQuantCache(n_layers, bits=4)),
+            ("three_zone",   ThreeZoneCache(n_layers, num_anchor=8, recent_window=24, middle_bits=4)),
+        ]:
+            r = streaming_run_with_cache(name, c, model, tok, wl, chunk_size=chunk, device="cpu")
+            rows.append((name, r.perplexity, r.memory_bytes / 1024, r.extra.get("streaming_chunk_size")))
+            print(f"  {name:14s} ppl={r.perplexity:.3f}  mem={r.memory_bytes/1024:.1f}KB  "
+                  f"chunk_size={r.extra.get('streaming_chunk_size')}")
+        assert all(r[3] == chunk for r in rows), "chunk_size should be recorded in extra"
+        print("OK: streaming runner exercises all caches end-to-end")
+    except Exception as e:
+        failures.append(f"streaming: {e}")
+        print(f"FAILED: {e}")
+
+    # ------------------------------------------------------------------ 9
+    banner("9. Trained-classifier scaffold (in-prompt MLP fit)")
+    if args.fake:
+        print("SKIPPED: needs real attention + hidden_states (run without --fake or in Colab)")
+    else:
+      try:
+        from primekv.classifier import MLPClassifier
+        from primekv.classifier_training import train_mlp_classifier_on_prompt
+
+        ids = tok(PROMPT * 2, return_tensors="pt", truncation=True, max_length=192)["input_ids"]
+        d_model = model.config.hidden_size if hasattr(model.config, "hidden_size") else model.config.n_embd
+        clf = MLPClassifier(d_model=d_model, hidden=64)
+        log = train_mlp_classifier_on_prompt(
+            clf, model, ids, epochs=30, lr=1e-3, anchor_prefix_len=16, hidden_layer_index=2,
+        )
+        print(f"trained on {log['n_positions']} positions, "
+              f"final_loss={log['final_loss']:.4f}, final_acc={log['final_accuracy']:.2%}")
+        print(f"per-tier accuracy: {log['per_tier_accuracy']}")
+        assert log["epoch_losses"][-1] <= log["epoch_losses"][0], "loss should not increase overall"
+        print("OK: classifier scaffold trains end-to-end")
+      except Exception as e:
+        failures.append(f"classifier_training: {e}")
+        print(f"FAILED: {e}")
+
     # ------------------------------------------------------------------ done
     banner(f"SMOKE TEST {'FAILED' if failures else 'PASSED'} "
            f"({time.time() - t_start:.0f}s)")

@@ -397,3 +397,109 @@ class StreamingQuantCache:
 
     def reset(self) -> None:
         self._entries = [OrderedDict() for _ in range(self.num_layers)]
+
+
+# ---------------------------------------------------------------------------
+# Three-zone cache (anchor + rolling FP16 window + compressed middle)
+# ---------------------------------------------------------------------------
+
+
+class ThreeZoneCache:
+    """Permanent anchor + rolling FP16 window + structurally-compressed middle.
+
+    Direct application of the U-shape / lost-in-the-middle / attention-sink
+    observation: full precision where attention actually concentrates (the
+    first few tokens and the most recent ones), aggressive compression
+    where it doesn't (the middle).
+
+    Mechanics:
+
+    * Positions ``[0, num_anchor)`` live in the **anchor** pool: FP16,
+      pinned, never evicted.
+    * The most recent ``recent_window`` non-anchor positions live in the
+      **recent** pool at FP16. As newer positions arrive, older ones age
+      out of the window.
+    * Aged-out positions move to the **middle** pool, re-encoded at
+      ``middle_bits`` (typically INT4). If ``middle_capacity`` is set,
+      the middle pool evicts oldest-first (FIFO) when full.
+
+    Composes the existing PrimeKV ideas — anchor pinning, eviction, per-zone
+    precision — but with a position-driven policy that matches the empirical
+    attention curve directly instead of going through a classifier.
+    """
+
+    def __init__(
+        self,
+        num_layers: int,
+        num_anchor: int = 16,
+        recent_window: int = 128,
+        middle_capacity: Optional[int] = None,
+        middle_bits: Optional[int] = 4,
+    ) -> None:
+        if middle_bits not in (None, 4, 8):
+            raise ValueError("middle_bits must be None, 4, or 8")
+        self.num_layers = num_layers
+        self.num_anchor = int(num_anchor)
+        self.recent_window = int(recent_window)
+        self.middle_capacity = middle_capacity
+        self.middle_bits = middle_bits
+        self._anchor: list[dict[int, tuple[torch.Tensor, torch.Tensor]]] = [
+            dict() for _ in range(num_layers)
+        ]
+        self._recent: list[OrderedDict[int, tuple[torch.Tensor, torch.Tensor]]] = [
+            OrderedDict() for _ in range(num_layers)
+        ]
+        self._middle: list[OrderedDict[int, tuple]] = [
+            OrderedDict() for _ in range(num_layers)
+        ]
+        self._max_pos = -1
+
+    def put(self, layer: int, position: int, k: torch.Tensor, v: torch.Tensor) -> None:
+        self._max_pos = max(self._max_pos, position)
+        if position < self.num_anchor:
+            self._anchor[layer][position] = (
+                k.to(torch.float16) if k.dtype != torch.float16 else k,
+                v.to(torch.float16) if v.dtype != torch.float16 else v,
+            )
+            return
+        self._recent[layer][position] = (
+            k.to(torch.float16) if k.dtype != torch.float16 else k,
+            v.to(torch.float16) if v.dtype != torch.float16 else v,
+        )
+        self._age_out_recent(layer)
+
+    def _age_out_recent(self, layer: int) -> None:
+        cutoff = self._max_pos - self.recent_window
+        old_keys = [p for p in self._recent[layer] if p <= cutoff]
+        for p in old_keys:
+            k_fp, v_fp = self._recent[layer].pop(p)
+            self._middle[layer][p] = _store_value(k_fp, v_fp, self.middle_bits)
+            if self.middle_capacity is not None and len(self._middle[layer]) > self.middle_capacity:
+                self._middle[layer].popitem(last=False)
+
+    def get(self, layer: int, position: int) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        if position in self._anchor[layer]:
+            return self._anchor[layer][position]
+        if position in self._recent[layer]:
+            return self._recent[layer][position]
+        if position in self._middle[layer]:
+            k_store, v_store = self._middle[layer][position]
+            return _load_value(k_store, v_store, self.middle_bits)
+        return None
+
+    def memory_bytes(self) -> int:
+        total = 0
+        for layer in range(self.num_layers):
+            for k, v in self._anchor[layer].values():
+                total += k.numel() * k.element_size() + v.numel() * v.element_size()
+            for k, v in self._recent[layer].values():
+                total += k.numel() * k.element_size() + v.numel() * v.element_size()
+            for k_store, v_store in self._middle[layer].values():
+                total += _storage_bytes(k_store, v_store, self.middle_bits)
+        return total
+
+    def reset(self) -> None:
+        self._anchor = [dict() for _ in range(self.num_layers)]
+        self._recent = [OrderedDict() for _ in range(self.num_layers)]
+        self._middle = [OrderedDict() for _ in range(self.num_layers)]
+        self._max_pos = -1

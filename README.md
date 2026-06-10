@@ -86,14 +86,52 @@ This is a real finding, not a failure. It tells us:
 - **Perplexity only.** No downstream task evaluation (LongBench, RULER, etc.).
 - **Production tooling integration.** vLLM / TensorRT-LLM integration is explicitly out of scope for v0.
 
-## Planned next steps
+## Research plan (current iteration)
 
-- POS/NER-based classifier (spaCy labels → tier assignments)
+The earlier round of results compared one-lever baselines (uniform INT4,
+FP16-only H2O) against PrimeKV's two-lever eviction × precision design.
+That comparison is structurally unfair in both directions. The harness now
+supports the experiments that actually answer whether PrimeKV has a regime:
+
+**Fair-comparison infrastructure (done, see notebook Section 8):**
+
+- **Composed baselines** — `H2OQuantCache`, `StreamingQuantCache` stack
+  eviction with INT8/INT4 storage, so the 2D sweep is two-lever-vs-two-lever.
+- **Long-context sweep** (`sweep_long_context`) — capacity scales with
+  prompt length at a fixed retention fraction, up to 16k tokens. The regime
+  where eviction has proportional leverage over fixed-ratio quantization.
+- **Seeds + aggregation** — top-k sampling with per-seed runs and
+  `aggregate_reports` for mean/std per cell, so charts carry error bars.
+- **Reasoning-persistence harness** (`primekv/reasoning.py`) — binary
+  retention tests with a *filtered pass rate* that only counts tests the
+  `full` baseline passes. (An earlier chart showed compressed caches
+  "beating" full — an artifact of crediting tests the base model already
+  failed for non-cache reasons.)
+
+**Three falsifiable questions the sweeps are designed to answer:**
+
+1. Does any PrimeKV point strictly dominate `h2o_int4` / `streamingllm_int4`
+   at equal compression on the 2D surface?
+2. Does PrimeKV separate from `uniform_int4` as context grows to 8k-16k?
+3. Does PrimeKV beat `h2o_int4` on the filtered reasoning pass rate?
+
+Any one "yes" is a real wedge. Three "no"s means the method has no regime
+under the current classifier, and that's worth knowing now.
+
+**Chunked / streaming PrimeKV (diagnostics first, notebook Section 9):**
+
+A map-reduce variant — run PrimeKV per chunk, then re-budget across chunks —
+could reduce *peak* memory, which uniform quantization fundamentally can't.
+Whether it's well-founded depends on three measurements (attention U-shape,
+classifier/attention agreement, lossy-past prefill viability) that Section 9
+runs before any implementation is committed.
+
+**Still planned:**
+
 - Trained MLP classifier with weak labels from teacher attention
-- LongBench and RULER evaluation suites
-- Fair baselines: H2O+pinning, StreamingLLM+quantization
+- LongBench and RULER evaluation suites (the built-in reasoning suite is a
+  smoke test, not a benchmark)
 - 7B+ models at 8k-32k context (where compression actually bites)
-- Optional: autoresearch loop for hyperparameter optimization
 
 ## Repository layout
 
@@ -105,8 +143,13 @@ primekv/          core package
   quantize.py     INT8 / INT4 K and V (de)quantization
   metrics.py      perplexity, hit rate, mem, latency
   baselines.py    full / H2O / StreamingLLM / uniform quant
+                  + composed H2O+quant / Streaming+quant
+  sweep.py        pareto / vs-length / ablation / 2D / long-context
+                  sweeps + seed aggregation
+  reasoning.py    retention tests with filtered pass rate
 tests/            unit + smoke tests
 benchmarks/       perplexity / memory / latency / classifier_overhead
+                  + smoke_new_paths.py (CPU end-to-end check)
 ```
 
 ## Install

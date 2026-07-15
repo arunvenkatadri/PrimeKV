@@ -189,6 +189,9 @@ class MLPClassifier(BaseClassifier):
             if h.shape[0] != 1:
                 raise ValueError("MLPClassifier currently assumes batch size 1")
             h = h[0]
+        # fp16/bf16 models hand us Half hidden states; the head runs in its
+        # own parameter dtype.
+        h = h.to(self.net[0].weight.dtype)
         logits = self.net(h)  # (seq_len, NUM_TIERS)
         tiers = logits.argmax(dim=-1)
         return TierAssignment(tiers=tiers, logits=logits, meta={"classifier": "mlp"})

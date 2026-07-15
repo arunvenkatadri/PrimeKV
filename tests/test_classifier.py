@@ -40,3 +40,13 @@ def test_mlp_classifier_shapes():
     out = clf.classify(hidden_states=h)
     assert out.tiers.shape == (5,)
     assert out.logits.shape == (5, 4)
+
+
+def test_mlp_classifier_accepts_half_hidden_states():
+    # fp16 models hand the classifier Half hidden states; classify must
+    # cast to its own parameter dtype instead of crashing in F.linear.
+    clf = MLPClassifier(d_model=16)
+    h = torch.randn(5, 16, dtype=torch.float16)
+    out = clf.classify(hidden_states=h)
+    assert out.tiers.shape == (5,)
+    assert out.logits.dtype == torch.float32

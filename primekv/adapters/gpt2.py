@@ -202,6 +202,24 @@ def _sync(device: str) -> None:
         torch.cuda.synchronize()
 
 
+def _cache_needs_hidden_states(cache) -> bool:
+    clf = getattr(cache, "classifier", None)
+    return bool(getattr(clf, "requires_hidden_states", False))
+
+
+def _classifier_hidden_states(out, cache) -> torch.Tensor:
+    """Pick the classifier's layer from a forward pass's hidden states."""
+    hs = getattr(out, "hidden_states", None)
+    if not hs:
+        raise RuntimeError(
+            "classifier requires hidden_states but the model returned none — "
+            "was the forward pass run with output_hidden_states=True?"
+        )
+    clf = getattr(cache, "classifier", None)
+    idx = max(0, min(int(getattr(clf, "hidden_layer_index", 2)), len(hs) - 1))
+    return hs[idx][0]  # (seq_len, d_model)
+
+
 @torch.no_grad()
 def run_with_cache(
     name: str,
@@ -222,13 +240,18 @@ def run_with_cache(
     seq_len = int(input_ids.shape[-1])
 
     # --- Prefill (full HF cache, then mirror into our cache) ----------
+    needs_hidden = _cache_needs_hidden_states(cache)
     _sync(device)
     t0 = time.perf_counter()
-    out = model(input_ids=input_ids, use_cache=True)
+    if needs_hidden:
+        out = model(input_ids=input_ids, use_cache=True, output_hidden_states=True)
+    else:
+        out = model(input_ids=input_ids, use_cache=True)
     kv_pairs = _extract_kv_pairs(out.past_key_values)
 
     if hasattr(cache, "classify_prefill"):
-        cache.classify_prefill(input_ids=input_ids[0])
+        hidden = _classifier_hidden_states(out, cache) if needs_hidden else None
+        cache.classify_prefill(input_ids=input_ids[0], hidden_states=hidden)
 
     for layer, (k, v) in enumerate(kv_pairs):
         # k, v: (1, num_heads, seq_len, head_dim).
@@ -372,7 +395,16 @@ def streaming_run_with_cache(
         # see globally-correct tier assignments. The cost is one extra
         # tokenizer pass; the alternative (per-chunk classification with
         # local indices) would corrupt anchor/stride globally.
-        cache.classify_prefill(input_ids=input_ids[0])
+        hidden = None
+        if _cache_needs_hidden_states(cache):
+            # Hidden-state classifiers force one full-prompt forward here,
+            # which sacrifices the peak-memory benefit of streaming prefill.
+            # A chunked classifier pass is future work.
+            hs_out = model(
+                input_ids=input_ids, use_cache=False, output_hidden_states=True
+            )
+            hidden = _classifier_hidden_states(hs_out, cache)
+        cache.classify_prefill(input_ids=input_ids[0], hidden_states=hidden)
 
     _sync(device)
     t0 = time.perf_counter()

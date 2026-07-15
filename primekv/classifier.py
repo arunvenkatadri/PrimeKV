@@ -78,7 +78,12 @@ class BaseClassifier(nn.Module):
     It returns a :class:`TierAssignment`. Subclasses should override
     ``classify``; ``forward`` is kept for ``nn.Module`` compatibility but by
     default just delegates.
+
+    Runners check ``requires_hidden_states`` to know whether they must
+    extract hidden states from the base model before calling ``classify``.
     """
+
+    requires_hidden_states: bool = False
 
     def classify(
         self,
@@ -165,10 +170,23 @@ class MLPClassifier(BaseClassifier):
 
     Deliberately minimal — two-layer MLP. Replace with something smarter
     (attention-pooled, position-aware, etc.) later.
+
+    ``hidden_layer_index`` records which base-model layer's hidden states
+    this head expects; runners use it when extracting classifier input.
+    It must match the ``hidden_layer_index`` used at training time.
     """
 
-    def __init__(self, d_model: int, hidden: int = 256, dropout: float = 0.1) -> None:
+    requires_hidden_states = True
+
+    def __init__(
+        self,
+        d_model: int,
+        hidden: int = 256,
+        dropout: float = 0.1,
+        hidden_layer_index: int = 2,
+    ) -> None:
         super().__init__()
+        self.hidden_layer_index = hidden_layer_index
         self.net = nn.Sequential(
             nn.Linear(d_model, hidden),
             nn.GELU(),

@@ -90,10 +90,11 @@ class _FakeConfig:
 
 
 class _FakeOutput:
-    def __init__(self, logits, past_key_values, loss=None):
+    def __init__(self, logits, past_key_values, loss=None, hidden_states=None):
         self.logits = logits
         self.past_key_values = past_key_values
         self.loss = loss
+        self.hidden_states = hidden_states
 
 
 class _FakeCausalLM:
@@ -125,9 +126,24 @@ class _FakeCausalLM:
     def parameters(self):  # pragma: no cover — not used in these tests
         return iter([])
 
-    def __call__(self, input_ids=None, past_key_values=None, labels=None, use_cache=False):
+    def __call__(
+        self,
+        input_ids=None,
+        past_key_values=None,
+        labels=None,
+        use_cache=False,
+        output_hidden_states=False,
+    ):
         batch = input_ids.shape[0]
         seq_len = input_ids.shape[-1]
+
+        hidden_states = None
+        if output_hidden_states:
+            # Embeddings + one output per layer, HF convention.
+            hidden_states = tuple(
+                torch.randn(batch, seq_len, self.config.hidden_size)
+                for _ in range(self.num_layers + 1)
+            )
 
         # Deterministic "logits" derived from input_ids.
         logits = torch.zeros(batch, seq_len, self.vocab)
@@ -157,7 +173,9 @@ class _FakeCausalLM:
                 new_past.append((k_new, v_new))
             past = tuple(new_past)
 
-        return _FakeOutput(logits=logits, past_key_values=past, loss=loss)
+        return _FakeOutput(
+            logits=logits, past_key_values=past, loss=loss, hidden_states=hidden_states
+        )
 
 
 class _FakeTokenizer:
@@ -197,6 +215,30 @@ def test_run_with_cache_end_to_end_full_cache():
     assert math.isfinite(result.perplexity)
     assert result.generated is not None
     assert result.tokens_per_second > 0
+
+
+def test_run_with_cache_mlp_classifier_gets_hidden_states():
+    # MLPClassifier needs hidden states at prefill; the runner must fetch
+    # and pass them (previously it passed input_ids only -> ValueError).
+    from primekv.cache import PrimeKVCache
+    from primekv.classifier import MLPClassifier
+
+    model = _FakeCausalLM(num_layers=2, num_heads=2, head_dim=4, vocab=17)
+    tok = _FakeTokenizer(vocab=17)
+    clf = MLPClassifier(d_model=model.config.hidden_size, hidden=8)
+    clf.eval()
+    cache = PrimeKVCache(num_layers=2, classifier=clf)
+
+    result = run_with_cache(
+        "primekv_mlp",
+        cache,
+        model,
+        tok,
+        Workload(prompt="hello world", decode_tokens=2, max_length=8),
+        device="cpu",
+    )
+    assert result.name == "primekv_mlp"
+    assert math.isfinite(result.perplexity)
 
 
 def test_run_comparison_on_fake_model_produces_ordered_results():
